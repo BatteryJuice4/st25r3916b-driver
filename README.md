@@ -40,6 +40,11 @@ microcontroller.
   from PT_Memory (loaded with the NFCID1/ATQA/SAK, 4- or 7-byte UID); the host is notified
   when a reader selects the card, then handles the higher-layer frames (RATS/APDU) over the
   FIFO. Exercised in the unit test against a fake reader.
+- **Wake-up mode** (`st25r3916_wakeup_start` / `wakeup_cause` / `wakeup_stop`): low-power tag
+  detection. The chip sleeps with the oscillator off and wakes on its own timer to measure
+  the antenna amplitude and/or phase, raising an interrupt when a tag detunes the antenna past
+  a threshold. Supports a fixed calibrated reference or a drift-tracking auto-average. The
+  delta thresholds are antenna-specific and must be tuned on hardware.
 
 **Not implemented yet** (contributions welcome — these need the datasheet's analog/RF
 sections and, to be trusted, a real chip):
@@ -50,7 +55,6 @@ sections and, to be trusted, a real chip):
   reports `ST25R_ERR_COLLISION` when more than one answers).
 - Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz, as reader or
   as a target.
-- Low-power card detection (wake-up mode).
 
 ## Using it
 
@@ -102,6 +106,7 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_transceive` | Send/receive a frame (CRC, parity, anticollision flags) |
 | `st25r3916_nfca_request` / `nfca_select` | REQA/WUPA and the ISO 14443-A UID cascade |
 | `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_stop` | NFC-A card emulation |
+| `st25r3916_wakeup_start` / `wakeup_cause` / `wakeup_stop` | Low-power tag detection (wake-up mode) |
 
 The RF calls expect the chip's IRQ pin wired to an optional `st25r_bus_t.wait_irq` callback
 (they poll the interrupt registers if it is `NULL`). They return `ST25R_OK` or a negative

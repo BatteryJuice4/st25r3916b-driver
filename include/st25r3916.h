@@ -179,4 +179,42 @@ st25r_listen_event_t st25r3916_listen_poll(st25r_t *d, uint8_t *rx, int rx_cap, 
 int st25r3916_listen_respond(st25r_t *d, const uint8_t *tx, int tx_len, bool with_crc,
                              int timeout_ms);
 
+/* ---- RF: wake-up mode (low-power tag detection, DS13541 §4.5.67-69) ---------------------
+ *
+ * UNTESTED ON HARDWARE. The chip sleeps with the main oscillator off and wakes on its own
+ * timer to measure the antenna's amplitude and/or phase; when the change from a reference
+ * exceeds a threshold (a tag entering the field detunes the antenna) it raises an interrupt
+ * on the IRQ pin to wake the host. The host then runs a normal poll to see if a tag is
+ * really there. The right thresholds depend on the antenna and must be tuned on hardware.
+ */
+
+typedef struct {
+    bool measure_amplitude; /* wake on an amplitude change */
+    bool measure_phase;     /* wake on a phase change */
+    uint8_t period;         /* 0..7: wake-up period = (period + 1) x step */
+    bool fast_period;       /* false: 100 ms step, true: 10 ms step */
+    uint8_t am_delta;       /* 0..15: amplitude change from the reference that wakes (Δam) */
+    uint8_t ph_delta;       /* 0..15: phase change from the reference that wakes (Δpm) */
+    bool auto_average;      /* true: track a slow-moving reference (ignores drift); false:
+                             * take one reference measurement now and hold it */
+} st25r_wakeup_cfg_t;
+
+/* Flags returned by st25r3916_wakeup_cause(). */
+enum {
+    ST25R_WAKE_TIMER = 1u << 0,     /* the wake-up timer elapsed (if the timer IRQ is on) */
+    ST25R_WAKE_AMPLITUDE = 1u << 1, /* the amplitude changed past Δam */
+    ST25R_WAKE_PHASE = 1u << 2,     /* the phase changed past Δpm */
+};
+
+/* Enter wake-up mode per `cfg`: configure the measurement(s), establish the reference,
+ * mask every interrupt except the wake sources, and power down to periodic sensing. The
+ * host should then sleep until the IRQ pin wakes it. Returns ST25R_OK or a negative error. */
+int st25r3916_wakeup_start(st25r_t *d, const st25r_wakeup_cfg_t *cfg);
+
+/* After the IRQ wakes the host, read why: a bitmask of ST25R_WAKE_*. */
+int st25r3916_wakeup_cause(st25r_t *d);
+
+/* Leave wake-up mode and restore the default (unmasked) interrupts. */
+void st25r3916_wakeup_stop(st25r_t *d);
+
 #endif

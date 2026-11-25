@@ -222,6 +222,23 @@ enum {
 #define ST25R_PT_OFF_SELR_L3 14  /* location 14: SEL level 3 response (RFU for NFC-A) */
 #define ST25R_PT_NFCA_LEN 15     /* bytes written for an NFC-A target */
 
+/* ---- Wake-up timer control register (0x32, DS13541 Table 103/104) ----------------------
+ * Low-power tag detection: the chip wakes on the timer, measures the antenna amplitude
+ * and/or phase, and raises I_wam / I_wph if the change from the reference exceeds the delta.
+ * Period = (wut + 1) x step, step 100 ms (wur=0) or 10 ms (wur=1). */
+#define ST25R_WUT_WUR (1u << 7)   /* 0: 100 ms step, 1: 10 ms step */
+#define ST25R_WUT_SHIFT 4         /* wut2:0 timeout value */
+#define ST25R_WUT_WTO (1u << 3)   /* raise an IRQ at every timeout */
+#define ST25R_WUT_WAM (1u << 2)   /* measure amplitude at each timeout */
+#define ST25R_WUT_WPH (1u << 1)   /* measure phase at each timeout */
+
+/* ---- Amplitude/phase measurement config registers (0x33 amplitude, 0x37 phase; same
+ *      layout, DS13541 Table 105/115) ------------------------------------------------------ */
+#define ST25R_MEAS_D_SHIFT 4       /* delta (am_d3:0 / pm_d3:0) that triggers the interrupt */
+#define ST25R_MEAS_AAM (1u << 3)   /* include the IRQ-causing measurement in auto-averaging */
+#define ST25R_MEAS_AEW_SHIFT 1     /* auto-averaging weight (00:4 01:8 10:16 11:32) */
+#define ST25R_MEAS_AE (1u << 0)    /* 1: use auto-averaging as reference; 0: use the ref reg */
+
 /* ---- Interrupt registers: main 0x1A (Table 62), timer/NFC 0x1B (Table 63),
  *      error/wake-up 0x1C (Table 64). The masks at 0x16..0x18 share the same bit layout.
  *      Reading 0x1A..0x1D (auto-increment, 4 bytes) returns and clears all pending IRQs. */

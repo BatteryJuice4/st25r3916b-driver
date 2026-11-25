@@ -528,3 +528,102 @@ int st25r3916_listen_respond(st25r_t *d, const uint8_t *tx, int tx_len, bool wit
     }
     return ST25R_OK;
 }
+
+/* ===== RF: wake-up mode (low-power tag detection, DS13541 §4.5.67-69) ==================
+ * UNTESTED ON HARDWARE. See the header for the contract and caveats. */
+
+/* Enable the oscillator and wait for it to stabilise (shared by the RF entry points). */
+static int wait_ready(st25r_t *d)
+{
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_EN, ST25R_OP_EN);
+    for (int tries = 0; tries <= 100; tries++) {
+        if (st25r3916_read_reg(d, ST25R_REG_AUX_DISPLAY) & ST25R_AUX_OSC_OK) {
+            return ST25R_OK;
+        }
+        if (d->bus->delay_us) {
+            d->bus->delay_us(d->bus->ctx, 100);
+        }
+    }
+    return ST25R_ERR_TIMEOUT;
+}
+
+/* Take one measurement with `measure_cmd` and copy the result register into the reference
+ * register, so a later wake-up compares against the field as it is right now (no tag). */
+static void calibrate_ref(st25r_t *d, uint8_t measure_cmd, uint8_t display_reg, uint8_t ref_reg)
+{
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, measure_cmd);
+    wait_irqs(d, IRQ_T(ST25R_IRQ_DCT), 5);
+    st25r3916_write_reg(d, ref_reg, st25r3916_read_reg(d, display_reg));
+}
+
+int st25r3916_wakeup_start(st25r_t *d, const st25r_wakeup_cfg_t *cfg)
+{
+    if (!cfg || (!cfg->measure_amplitude && !cfg->measure_phase) ||
+        cfg->period > 7 || cfg->am_delta > 15 || cfg->ph_delta > 15) {
+        return ST25R_ERR_PARAM;
+    }
+
+    int rc = wait_ready(d);
+    if (rc != ST25R_OK) {
+        return rc;
+    }
+
+    if (cfg->measure_amplitude) {
+        uint8_t conf = (uint8_t)((cfg->am_delta << ST25R_MEAS_D_SHIFT) |
+                                 (cfg->auto_average ? ST25R_MEAS_AE : 0));
+        st25r3916_write_reg(d, ST25R_REG_AMPLITUDE_MEAS_CONF, conf);
+        if (!cfg->auto_average) {
+            calibrate_ref(d, ST25R_CMD_MEASURE_AMPLITUDE, ST25R_REG_AMPLITUDE_MEAS_DISPLAY,
+                          ST25R_REG_AMPLITUDE_MEAS_REF);
+        }
+    }
+    if (cfg->measure_phase) {
+        uint8_t conf = (uint8_t)((cfg->ph_delta << ST25R_MEAS_D_SHIFT) |
+                                 (cfg->auto_average ? ST25R_MEAS_AE : 0));
+        st25r3916_write_reg(d, ST25R_REG_PHASE_MEAS_CONF, conf);
+        if (!cfg->auto_average) {
+            calibrate_ref(d, ST25R_CMD_MEASURE_PHASE, ST25R_REG_PHASE_MEAS_DISPLAY,
+                          ST25R_REG_PHASE_MEAS_REF);
+        }
+    }
+
+    uint8_t wut = (uint8_t)((cfg->fast_period ? ST25R_WUT_WUR : 0) |
+                            ((cfg->period & 0x7) << ST25R_WUT_SHIFT) |
+                            (cfg->measure_amplitude ? ST25R_WUT_WAM : 0) |
+                            (cfg->measure_phase ? ST25R_WUT_WPH : 0));
+    st25r3916_write_reg(d, ST25R_REG_WAKEUP_TIMER_CONTROL, wut);
+
+    /* Let only the wake sources (I_wam / I_wph / I_wt) reach the IRQ pin. */
+    uint32_t keep = ST25R_IRQ_WAM | ST25R_IRQ_WPH | ST25R_IRQ_WT;
+    uint32_t mask = 0xFFu | (0xFFu << 8) | ((uint32_t)(0xFFu & ~keep) << 16) | (0xFFu << 24);
+    st25r3916_set_interrupt_mask(d, mask);
+
+    /* Power down to periodic sensing: wake-up mode on, oscillator/receiver/transmitter off. */
+    st25r3916_get_interrupts(d);
+    st25r3916_write_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_WU);
+    return ST25R_OK;
+}
+
+int st25r3916_wakeup_cause(st25r_t *d)
+{
+    uint8_t e = ST25R_IRQ_ERROR_WUP(st25r3916_get_interrupts(d));
+    int flags = 0;
+    if (e & ST25R_IRQ_WT) {
+        flags |= ST25R_WAKE_TIMER;
+    }
+    if (e & ST25R_IRQ_WAM) {
+        flags |= ST25R_WAKE_AMPLITUDE;
+    }
+    if (e & ST25R_IRQ_WPH) {
+        flags |= ST25R_WAKE_PHASE;
+    }
+    return flags;
+}
+
+void st25r3916_wakeup_stop(st25r_t *d)
+{
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_WU | ST25R_OP_EN, 0);
+    st25r3916_set_interrupt_mask(d, 0); /* default: nothing masked */
+}

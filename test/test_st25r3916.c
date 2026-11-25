@@ -36,6 +36,10 @@ static bool g_card_present;
 static uint8_t g_pt[16];
 static int g_pt_len;
 
+/* Wake-up mode: the antenna amplitude/phase a measurement command would report. */
+static uint8_t g_sim_amp = 0x5C;
+static uint8_t g_sim_phase = 0x33;
+
 #define FI_M(bit) ((uint32_t)(bit))
 #define FI_T(bit) ((uint32_t)(bit) << 8)
 
@@ -223,6 +227,14 @@ static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
         case ST25R_CMD_TRANSMIT_WITHOUT_CRC:
             card_transmit();
             break;
+        case ST25R_CMD_MEASURE_AMPLITUDE:
+            g_rega[ST25R_REG_AMPLITUDE_MEAS_DISPLAY] = g_sim_amp;
+            g_irq |= FI_T(ST25R_IRQ_DCT);
+            break;
+        case ST25R_CMD_MEASURE_PHASE:
+            g_rega[ST25R_REG_PHASE_MEAS_DISPLAY] = g_sim_phase;
+            g_irq |= FI_T(ST25R_IRQ_DCT);
+            break;
         default:
             break;
         }
@@ -409,6 +421,61 @@ int main(void)
     /* ---- a bad NFCID1 length is rejected ---- */
     st25r_nfca_target_t bad = {.nfcid1_len = 5};
     CHECK_EQ(st25r3916_listen_start(&d, &bad), ST25R_ERR_PARAM);
+
+    /* ================= Wake-up mode (low-power tag detection) ================= */
+    reset_chip();
+    g_sim_amp = 0x5C;
+
+    /* ---- start: amplitude sensing, fixed reference calibrated from a measurement ---- */
+    st25r_wakeup_cfg_t wcfg = {.measure_amplitude = true,
+                               .period = 2, /* (2+1) x 100 ms = 300 ms */
+                               .fast_period = false,
+                               .am_delta = 3,
+                               .auto_average = false};
+    CHECK_EQ(st25r3916_wakeup_start(&d, &wcfg), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_AMPLITUDE_MEAS_CONF], 3u << ST25R_MEAS_D_SHIFT); /* Δam, fixed ref */
+    CHECK_EQ(g_rega[ST25R_REG_AMPLITUDE_MEAS_REF], 0x5C); /* calibrated to the measurement */
+    CHECK_EQ(g_rega[ST25R_REG_WAKEUP_TIMER_CONTROL],
+             (2u << ST25R_WUT_SHIFT) | ST25R_WUT_WAM);
+    CHECK_EQ(g_rega[ST25R_REG_OP_CONTROL], ST25R_OP_WU);       /* powered down to sensing */
+    CHECK(!(g_rega[ST25R_REG_OP_CONTROL] & ST25R_OP_EN));
+    CHECK_EQ(g_rega[ST25R_REG_MASK_MAIN_IRQ], 0xFF);          /* only wake IRQs unmasked */
+    CHECK_EQ(g_rega[ST25R_REG_MASK_ERROR_WUP_IRQ],
+             (uint8_t)(0xFF & ~(ST25R_IRQ_WAM | ST25R_IRQ_WPH | ST25R_IRQ_WT)));
+
+    /* ---- a tag enters the field: the chip raises I_wam; the host reads the cause ---- */
+    g_irq |= (uint32_t)ST25R_IRQ_WAM << 16; /* error/wake-up register */
+    CHECK_EQ(st25r3916_wakeup_cause(&d), ST25R_WAKE_AMPLITUDE);
+
+    /* ---- stop restores normal interrupts and leaves wake-up mode ---- */
+    st25r3916_wakeup_stop(&d);
+    CHECK(!(g_rega[ST25R_REG_OP_CONTROL] & ST25R_OP_WU));
+    CHECK_EQ(g_rega[ST25R_REG_MASK_ERROR_WUP_IRQ], 0x00);
+
+    /* ---- phase + amplitude with auto-averaging: no fixed reference is written ---- */
+    reset_chip();
+    st25r_wakeup_cfg_t wcfg2 = {.measure_amplitude = true,
+                                .measure_phase = true,
+                                .period = 0,
+                                .fast_period = true,
+                                .am_delta = 4,
+                                .ph_delta = 5,
+                                .auto_average = true};
+    CHECK_EQ(st25r3916_wakeup_start(&d, &wcfg2), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_AMPLITUDE_MEAS_CONF],
+             (4u << ST25R_MEAS_D_SHIFT) | ST25R_MEAS_AE);
+    CHECK_EQ(g_rega[ST25R_REG_PHASE_MEAS_CONF], (5u << ST25R_MEAS_D_SHIFT) | ST25R_MEAS_AE);
+    CHECK_EQ(g_rega[ST25R_REG_AMPLITUDE_MEAS_REF], 0x00); /* auto-average: ref left alone */
+    CHECK_EQ(g_rega[ST25R_REG_WAKEUP_TIMER_CONTROL],
+             ST25R_WUT_WUR | ST25R_WUT_WAM | ST25R_WUT_WPH);
+    g_irq |= (uint32_t)ST25R_IRQ_WPH << 16;
+    CHECK_EQ(st25r3916_wakeup_cause(&d), ST25R_WAKE_PHASE);
+
+    /* ---- parameter validation ---- */
+    st25r_wakeup_cfg_t none = {.period = 1};
+    CHECK_EQ(st25r3916_wakeup_start(&d, &none), ST25R_ERR_PARAM); /* no measurement selected */
+    st25r_wakeup_cfg_t bigp = {.measure_amplitude = true, .period = 8};
+    CHECK_EQ(st25r3916_wakeup_start(&d, &bigp), ST25R_ERR_PARAM); /* period out of range */
 
     TEST_MAIN_END();
 }
