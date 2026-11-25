@@ -25,14 +25,25 @@ microcontroller.
   four mask registers, via a packed 32-bit value.
 - Device identification: `st25r3916_probe()` reads the IC identity register and confirms the
   part is an ST25R3916B.
+- **Power-up to Ready** (`st25r3916_field_on` / `field_off`): oscillator start with the
+  `osc_ok` wait, `Adjust regulators`, NFC-A reader mode at 106 kbit/s, and field-on with
+  initial RF collision avoidance and the ISO 14443 guard time (DS13541 §4.2.13).
+- **Interrupt-driven transceive** (`st25r3916_transceive`): TX from the FIFO with the
+  number-of-transmitted-bytes registers, RX back out of it, CRC / parity / bit-oriented
+  anticollision framing flags, and error/collision/CRC reporting.
+- **NFC-A activation** (`st25r3916_nfca_request`, `st25r3916_nfca_select`): REQA/WUPA and the
+  full ISO 14443-A anticollision + SELECT cascade (levels 1–3) for a single card, returning
+  the UID (4/7/10 bytes), ATQA and SAK. The unit test drives it against a fake card that
+  answers both 4- and 7-byte-UID cascades.
 
 **Not implemented yet** (contributions welcome — these need the datasheet's analog/RF
 sections and, to be trusted, a real chip):
 
-- Power-up sequence (oscillator start, `Adjust regulators`) and the analog-config register
-  values (those depend on your antenna and matching network).
-- NFC-A polling / ISO 14443-A anticollision.
-- Interrupt-driven transceive (TX from the FIFO, RX with CRC/parity handling).
+- The **analog-config register values** (receiver, modulation, regulators) — those depend on
+  your antenna and matching network, so `field_on` leaves the reset defaults in place.
+- **Multi-card collision resolution** (the current anticollision reads a single card and
+  reports `ST25R_ERR_COLLISION` when more than one answers).
+- Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz polling.
 - Card emulation (target / listen mode).
 - Low-power card detection (wake-up mode).
 
@@ -82,6 +93,13 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_write_fifo` / `read_fifo` / `fifo_count` | 512-byte FIFO |
 | `st25r3916_get_interrupts` / `set_interrupt_mask` | The four interrupt / mask registers |
 | `st25r3916_cmd` | Any direct command (`ST25R_CMD_*`) |
+| `st25r3916_field_on` / `field_off` | Power up to Ready and switch the RF field on/off |
+| `st25r3916_transceive` | Send/receive a frame (CRC, parity, anticollision flags) |
+| `st25r3916_nfca_request` / `nfca_select` | REQA/WUPA and the ISO 14443-A UID cascade |
+
+The RF calls expect the chip's IRQ pin wired to an optional `st25r_bus_t.wait_irq` callback
+(they poll the interrupt registers if it is `NULL`). They return `ST25R_OK` or a negative
+`ST25R_ERR_*`.
 
 No dynamic allocation. The calls are safe to use from an ISR if your bus callback is.
 

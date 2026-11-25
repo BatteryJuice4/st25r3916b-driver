@@ -127,3 +127,273 @@ bool st25r3916_probe(st25r_t *d)
     d->ic_rev = (uint8_t)(id & ST25R_IC_REV_MASK);
     return d->ic_type == ST25R_IC_TYPE_ST25R3916B;
 }
+
+/* ===== RF: power-up and ISO 14443-A reader (DS13541 §4.2.13) ============================
+ * UNTESTED ON HARDWARE. See the header for the contract and caveats. */
+
+#include <string.h>
+
+/* Pack an interrupt bit into the 32-bit value st25r3916_get_interrupts() returns:
+ * M = main (0x1A), T = timer/NFC (0x1B), E = error/wake-up (0x1C). */
+#define IRQ_M(bit) ((uint32_t)(bit))
+#define IRQ_T(bit) ((uint32_t)(bit) << 8)
+#define IRQ_E(bit) ((uint32_t)(bit) << 16)
+
+/* Wait up to `timeout_ms` for any interrupt in `want` (packed). Returns the accumulated
+ * interrupts that were seen (so the caller can tell which fired), or 0 on timeout. */
+static uint32_t wait_irqs(st25r_t *d, uint32_t want, int timeout_ms)
+{
+    uint32_t got = 0;
+    int remaining = timeout_ms > 0 ? timeout_ms : 1;
+    while (remaining > 0) {
+        if (d->bus->wait_irq) {
+            bool fired = d->bus->wait_irq(d->bus->ctx, remaining);
+            got |= st25r3916_get_interrupts(d);
+            if (got & want) {
+                return got;
+            }
+            if (!fired) {
+                break; /* the IRQ wait timed out */
+            }
+            remaining--; /* fired for another reason; keep waiting, bounded */
+        } else {
+            if (d->bus->delay_us) {
+                d->bus->delay_us(d->bus->ctx, 1000);
+            }
+            got |= st25r3916_get_interrupts(d);
+            if (got & want) {
+                return got;
+            }
+            remaining--;
+        }
+    }
+    return 0;
+}
+
+int st25r3916_field_on(st25r_t *d)
+{
+    st25r3916_cmd(d, ST25R_CMD_SET_DEFAULT);
+    if (d->bus->delay_us) {
+        d->bus->delay_us(d->bus->ctx, 1000);
+    }
+
+    /* Ready mode: enable the oscillator and regulators, then wait for the crystal to settle
+     * (osc_ok in the auxiliary display register; DS13541 §4.2.13). */
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_EN, ST25R_OP_EN);
+    int tries = 0;
+    while (!(st25r3916_read_reg(d, ST25R_REG_AUX_DISPLAY) & ST25R_AUX_OSC_OK)) {
+        if (d->bus->delay_us) {
+            d->bus->delay_us(d->bus->ctx, 100);
+        }
+        if (++tries > 100) { /* ~10 ms */
+            return ST25R_ERR_TIMEOUT;
+        }
+    }
+
+    /* NFC-A reader at 106 kbit/s: initiator, ISO14443A, standard framing. */
+    st25r3916_write_reg(d, ST25R_REG_MODE, (uint8_t)(ST25R_OM_ISO14443A << ST25R_MODE_OM_SHIFT));
+    st25r3916_write_reg(d, ST25R_REG_BIT_RATE,
+                        (uint8_t)((ST25R_BR_106 << ST25R_BR_TX_SHIFT) | (ST25R_BR_106 << ST25R_BR_RX_SHIFT)));
+
+    /* Match the regulated voltages to the supply. */
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, ST25R_CMD_ADJUST_REGULATORS);
+    wait_irqs(d, IRQ_T(ST25R_IRQ_DCT), 10);
+
+    /* Enable the receiver and transmitter. */
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_RX_EN | ST25R_OP_TX_EN,
+                         ST25R_OP_RX_EN | ST25R_OP_TX_EN);
+
+    /* Switch the field on with initial RF collision avoidance (does not transmit if another
+     * reader's field is already present). I_cat means the field is on and the minimum guard
+     * time has started; I_cac means an external field was detected and ours stayed off. */
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, ST25R_CMD_INITIAL_FIELD_ON);
+    uint32_t irq = wait_irqs(d, IRQ_T(ST25R_IRQ_CAT) | IRQ_T(ST25R_IRQ_CAC), 15);
+    if (irq & IRQ_T(ST25R_IRQ_CAC)) {
+        return ST25R_ERR_COLLISION;
+    }
+    if (!(irq & IRQ_T(ST25R_IRQ_CAT))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+    /* ISO 14443 guard time: the field must be on a while before the first command (~5 ms). */
+    if (d->bus->delay_us) {
+        d->bus->delay_us(d->bus->ctx, 5000);
+    }
+    return ST25R_OK;
+}
+
+void st25r3916_field_off(st25r_t *d)
+{
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    /* Drop the transmitter and the oscillator/regulators to idle. */
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL,
+                         ST25R_OP_EN | ST25R_OP_RX_EN | ST25R_OP_TX_EN, 0);
+}
+
+int st25r3916_transceive(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags,
+                         uint8_t *rx, int rx_cap, int *rx_bits, int timeout_ms)
+{
+    if (tx_bits < 0) {
+        return ST25R_ERR_PARAM;
+    }
+    int nbytes = tx_bits / 8;
+    int nbits = tx_bits % 8;
+    int fifo_bytes = nbytes + (nbits ? 1 : 0);
+    if (fifo_bytes > ST25R_FIFO_DEPTH) {
+        return ST25R_ERR_PARAM;
+    }
+
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    st25r3916_cmd(d, ST25R_CMD_RESET_RXGAIN);
+
+    /* Framing: anticollision bit-orientation and parity handling. */
+    uint8_t a_mask = ST25R_A_ANTCL | ST25R_A_NO_TX_PAR | ST25R_A_NO_RX_PAR;
+    uint8_t a_val = 0;
+    if (flags & ST25R_TX_ANTICOL) {
+        a_val |= ST25R_A_ANTCL;
+    }
+    if (flags & ST25R_TX_NO_PARITY) {
+        a_val |= ST25R_A_NO_TX_PAR | ST25R_A_NO_RX_PAR;
+    }
+    st25r3916_modify_reg(d, ST25R_REG_ISO14443A_NFC, a_mask, a_val);
+
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, ST25R_NTX1(nbytes));
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, ST25R_NTX2(nbytes, nbits));
+    if (fifo_bytes > 0) {
+        st25r3916_write_fifo(d, tx, (size_t)fifo_bytes);
+    }
+
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, (flags & ST25R_TX_CRC) ? ST25R_CMD_TRANSMIT_WITH_CRC
+                                            : ST25R_CMD_TRANSMIT_WITHOUT_CRC);
+    if (!(wait_irqs(d, IRQ_M(ST25R_IRQ_TXE), timeout_ms) & IRQ_M(ST25R_IRQ_TXE))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+
+    uint32_t want = IRQ_M(ST25R_IRQ_RXE) | IRQ_M(ST25R_IRQ_COL) | IRQ_T(ST25R_IRQ_NRE) |
+                    IRQ_E(ST25R_IRQ_CRC | ST25R_IRQ_PAR | ST25R_IRQ_ERR1 | ST25R_IRQ_ERR2);
+    uint32_t irq = wait_irqs(d, want, timeout_ms);
+    if (irq & IRQ_M(ST25R_IRQ_COL)) {
+        return ST25R_ERR_COLLISION;
+    }
+    if (irq & IRQ_E(ST25R_IRQ_CRC | ST25R_IRQ_PAR)) {
+        return ST25R_ERR_CRC;
+    }
+    if (irq & IRQ_E(ST25R_IRQ_ERR1 | ST25R_IRQ_ERR2)) {
+        return ST25R_ERR_FRAMING;
+    }
+    if (!(irq & IRQ_M(ST25R_IRQ_RXE))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+
+    uint8_t fs[2];
+    st25r3916_read_regs(d, ST25R_REG_FIFO_STATUS1, fs, 2); /* read the count before emptying */
+    int count = fs[0] | ((fs[1] >> ST25R_FIFO2_B9_B8_SHIFT) << 8);
+    int lb = (fs[1] & ST25R_FIFO2_LB_MASK) >> ST25R_FIFO2_LB_SHIFT;
+    if (count > rx_cap) {
+        return ST25R_ERR_NOMEM;
+    }
+    if (count > 0) {
+        st25r3916_read_fifo(d, rx, (size_t)count);
+    }
+    if (rx_bits) {
+        *rx_bits = (lb && count) ? (count - 1) * 8 + lb : count * 8;
+    }
+    return count;
+}
+
+int st25r3916_nfca_request(st25r_t *d, uint8_t atqa[2], bool wupa)
+{
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    st25r3916_cmd(d, ST25R_CMD_RESET_RXGAIN);
+    /* Standard framing for the short frame (no anticollision, parity on). */
+    st25r3916_modify_reg(d, ST25R_REG_ISO14443A_NFC,
+                         ST25R_A_ANTCL | ST25R_A_NO_TX_PAR | ST25R_A_NO_RX_PAR, 0);
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, 0);
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, 0);
+
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, wupa ? ST25R_CMD_TRANSMIT_WUPA : ST25R_CMD_TRANSMIT_REQA);
+    if (!(wait_irqs(d, IRQ_M(ST25R_IRQ_TXE), 10) & IRQ_M(ST25R_IRQ_TXE))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+    uint32_t irq = wait_irqs(d, IRQ_M(ST25R_IRQ_RXE) | IRQ_M(ST25R_IRQ_COL) | IRQ_T(ST25R_IRQ_NRE), 10);
+    if (!(irq & (IRQ_M(ST25R_IRQ_RXE) | IRQ_M(ST25R_IRQ_COL)))) {
+        return ST25R_ERR_TIMEOUT; /* no card answered */
+    }
+    uint8_t fs[2];
+    st25r3916_read_regs(d, ST25R_REG_FIFO_STATUS1, fs, 2);
+    int count = fs[0] | ((fs[1] >> ST25R_FIFO2_B9_B8_SHIFT) << 8);
+    if (count < 2) {
+        return ST25R_ERR_FRAMING;
+    }
+    uint8_t buf[2];
+    st25r3916_read_fifo(d, buf, 2);
+    atqa[0] = buf[0];
+    atqa[1] = buf[1];
+    return ST25R_OK;
+}
+
+int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
+{
+    static const uint8_t SEL[3] = {0x93, 0x95, 0x97}; /* cascade levels 1..3 */
+    memset(out, 0, sizeof(*out));
+
+    int rc = st25r3916_nfca_request(d, out->atqa, false);
+    if (rc != ST25R_OK) {
+        return rc;
+    }
+
+    for (int lvl = 0; lvl < 3; lvl++) {
+        /* ANTICOLLISION: SEL + NVB=0x20 (no UID bits known), bit-oriented, no CRC.
+         * A single card answers with its 4 UID bytes of this level plus the BCC. */
+        uint8_t ac[2] = {SEL[lvl], 0x20};
+        uint8_t resp[8];
+        rc = st25r3916_transceive(d, ac, 16, ST25R_TX_ANTICOL, resp, sizeof(resp), NULL, 20);
+        if (rc == ST25R_ERR_COLLISION) {
+            return ST25R_ERR_COLLISION; /* more than one card; not resolved here */
+        }
+        if (rc < 0) {
+            return rc;
+        }
+        if (rc < 5) {
+            return ST25R_ERR_FRAMING;
+        }
+        uint8_t bcc = (uint8_t)(resp[0] ^ resp[1] ^ resp[2] ^ resp[3]);
+        if (bcc != resp[4]) {
+            return ST25R_ERR_FRAMING;
+        }
+
+        /* SELECT: SEL + NVB=0x70 + the 4 UID bytes + BCC, with CRC. The card returns SAK. */
+        uint8_t sel[7] = {SEL[lvl], 0x70, resp[0], resp[1], resp[2], resp[3], resp[4]};
+        uint8_t sak[4];
+        rc = st25r3916_transceive(d, sel, 56, ST25R_TX_CRC, sak, sizeof(sak), NULL, 20);
+        if (rc < 1) {
+            return rc < 0 ? rc : ST25R_ERR_FRAMING;
+        }
+        out->sak = sak[0];
+
+        /* Accumulate the UID. A level that carries the cascade tag (CT=0x88) contributes its
+         * last three bytes; a final level contributes all four. */
+        if (resp[0] == 0x88) {
+            if (out->uid_len + 3 <= (int)sizeof(out->uid)) {
+                out->uid[out->uid_len++] = resp[1];
+                out->uid[out->uid_len++] = resp[2];
+                out->uid[out->uid_len++] = resp[3];
+            }
+        } else {
+            if (out->uid_len + 4 <= (int)sizeof(out->uid)) {
+                out->uid[out->uid_len++] = resp[0];
+                out->uid[out->uid_len++] = resp[1];
+                out->uid[out->uid_len++] = resp[2];
+                out->uid[out->uid_len++] = resp[3];
+            }
+        }
+
+        if (!(sak[0] & 0x04)) { /* cascade complete (SAK cascade bit clear) */
+            return ST25R_OK;
+        }
+    }
+    return ST25R_ERR_FRAMING; /* ran out of cascade levels without completing */
+}

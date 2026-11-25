@@ -172,6 +172,35 @@ enum {
 #define ST25R_OM_TOPAZ 0x4
 /* Target om values (Table 25): ISO14443A passive target = 0x1, FeliCa passive = 0x4 */
 
+/* ---- Bit rate definition register (0x04, DS13541 Table 26/27) -------------------------- */
+#define ST25R_BR_TX_SHIFT 4 /* tx_rate1:0 */
+#define ST25R_BR_RX_SHIFT 0 /* rx_rate1:0 */
+#define ST25R_BR_106 0x0    /* fc/128 ~106 kbit/s */
+#define ST25R_BR_212 0x1    /* fc/64  ~212 */
+#define ST25R_BR_424 0x2    /* fc/32  ~424 */
+#define ST25R_BR_848 0x3    /* fc/16  ~848 */
+
+/* ---- ISO14443A and NFC 106kb/s settings register (0x05, DS13541 Table 28) -------------- */
+#define ST25R_A_NO_TX_PAR (1u << 7) /* no parity generated during Tx (raw) */
+#define ST25R_A_NO_RX_PAR (1u << 6) /* received parity put in FIFO; no parity/CRC check (raw) */
+#define ST25R_A_NFC_F0 (1u << 5)    /* NFCIP-1 transport frame format */
+#define ST25R_A_P_LEN_SHIFT 1       /* modulation pulse width (p_len3:0) */
+#define ST25R_A_ANTCL (1u << 0)     /* 1 = bit-oriented ISO14443 anticollision frame */
+
+/* ---- Number of transmitted bytes registers (0x22/0x23, DS13541 Table 70/71) ------------
+ * 13-bit full-byte count ntx split across the two registers; nbtx2:0 in 0x23 is the number
+ * of bits in the last (partial) byte, 0 for whole bytes only. */
+#define ST25R_NTX1(nbytes) ((uint8_t)(((nbytes) >> 5) & 0xFF))
+#define ST25R_NTX2(nbytes, nbits) ((uint8_t)((((nbytes) & 0x1F) << 3) | ((nbits) & 0x07)))
+
+/* ---- Auxiliary display register (0x31, DS13541 Table 98) ------------------------------- */
+#define ST25R_AUX_A_CHA (1u << 7)  /* Rx channel used (0 AM, 1 PM) */
+#define ST25R_AUX_EFD_O (1u << 6)  /* external field detected */
+#define ST25R_AUX_TX_ON (1u << 5)  /* transmission active */
+#define ST25R_AUX_OSC_OK (1u << 4) /* crystal oscillator stable */
+#define ST25R_AUX_RX_ON (1u << 3)  /* receive decoder enabled */
+#define ST25R_AUX_RX_ACT (1u << 2) /* receiving a message */
+
 /* ---- Interrupt registers: main 0x1A (Table 62), timer/NFC 0x1B (Table 63),
  *      error/wake-up 0x1C (Table 64). The masks at 0x16..0x18 share the same bit layout.
  *      Reading 0x1A..0x1D (auto-increment, 4 bytes) returns and clears all pending IRQs. */

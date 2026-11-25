@@ -30,6 +30,10 @@ typedef struct {
     void *ctx;
     void (*txn)(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n);
     void (*delay_us)(void *ctx, unsigned us);
+    /* Optional: block until the chip's IRQ pin is active or `timeout_ms` elapses; return
+     * true if it went active. If NULL, the RF flows poll the interrupt registers instead
+     * (works, but busier). Wire this to a semaphore your IRQ-pin ISR gives. */
+    bool (*wait_irq)(void *ctx, int timeout_ms);
 } st25r_bus_t;
 
 typedef struct {
@@ -37,6 +41,18 @@ typedef struct {
     uint8_t ic_type; /* filled by st25r3916_probe() */
     uint8_t ic_rev;
 } st25r_t;
+
+/* Negative return codes for the RF flows below. */
+enum {
+    ST25R_OK = 0,
+    ST25R_ERR_NODEV = -1,     /* probe failed: no ST25R3916B on the bus */
+    ST25R_ERR_TIMEOUT = -2,   /* expected interrupt / response did not arrive */
+    ST25R_ERR_COLLISION = -3, /* bit collision (more than one card, not resolved here) */
+    ST25R_ERR_CRC = -4,       /* CRC or parity error in the response */
+    ST25R_ERR_FRAMING = -5,   /* framing error / malformed response */
+    ST25R_ERR_NOMEM = -6,     /* caller's buffer too small */
+    ST25R_ERR_PARAM = -7,     /* bad argument */
+};
 
 /* ---- Register and command access (DS13541 §4.3.3, §4.4) -------------------------------- */
 
@@ -72,5 +88,54 @@ void st25r3916_set_interrupt_mask(st25r_t *d, uint32_t mask);
 /* Read the IC identity register (0x3F) into d->ic_type / d->ic_rev. Returns true if the part
  * reads back as an ST25R3916B (ic_type == 0x06). */
 bool st25r3916_probe(st25r_t *d);
+
+/* ---- RF: power-up and ISO 14443-A (NFC-A) reader ---------------------------------------
+ *
+ * UNTESTED ON HARDWARE. These follow DS13541 §4.2.13 ("Reader operation") and the ISO
+ * 14443-3 anticollision procedure. They assume a 4-wire SPI with the IRQ pin wired (see
+ * st25r_bus_t.wait_irq). Timings (guard time, timeouts) are conservative starting points to
+ * confirm against the datasheet and a real card.
+ */
+
+/* Bring the chip to Ready (oscillator + regulators), set NFC-A reader mode at 106 kbit/s,
+ * adjust the regulators, enable Rx/Tx, and switch the RF field on with the ISO 14443 guard
+ * time. Call st25r3916_probe() first. Returns ST25R_OK or a negative ST25R_ERR_*. Analog
+ * settings (receiver/modulation registers) keep their reset defaults here; a real design
+ * loads the values its antenna needs first. */
+int st25r3916_field_on(st25r_t *d);
+
+/* Switch the RF field off and return the chip to a low-power idle (oscillator off). */
+void st25r3916_field_off(st25r_t *d);
+
+/* Flags for st25r3916_transceive(). */
+enum {
+    ST25R_TX_CRC = 1u << 0,      /* append (and expect) the ISO 14443 CRC */
+    ST25R_TX_ANTICOL = 1u << 1,  /* this is a bit-oriented anticollision frame (sets antcl) */
+    ST25R_TX_NO_PARITY = 1u << 2, /* raw: no parity generated/checked (e.g. MIFARE layers) */
+};
+
+/* Send `tx_bits` bits from `tx` and receive the card's answer into `rx` (capacity
+ * `rx_cap` bytes). `*rx_bits` (may be NULL) receives the answer's length in bits (the last
+ * byte may be partial). Returns the answer length in bytes (rounded up) or a negative
+ * ST25R_ERR_*. The field must already be on. */
+int st25r3916_transceive(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags,
+                         uint8_t *rx, int rx_cap, int *rx_bits, int timeout_ms);
+
+typedef struct {
+    uint8_t atqa[2];  /* answer to request (SENS_RES) */
+    uint8_t uid[10];  /* 4, 7 or 10 bytes */
+    uint8_t uid_len;
+    uint8_t sak;      /* select acknowledge (SAK) of the last cascade level */
+} st25r_nfca_t;
+
+/* ISO 14443-A REQA (0x26) short frame; returns the 2-byte ATQA or ST25R_ERR_TIMEOUT if no
+ * card answered. Use WUPA (true) to also wake halted cards. */
+int st25r3916_nfca_request(st25r_t *d, uint8_t atqa[2], bool wupa);
+
+/* Full ISO 14443-A activation: REQA, then the anticollision + SELECT cascade (levels 1..3)
+ * to read the UID and SAK of a single card in the field into `out`. Returns ST25R_OK, or
+ * ST25R_ERR_COLLISION if more than one card is present (this driver does not yet resolve
+ * collisions), or another negative ST25R_ERR_*. */
+int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out);
 
 #endif
