@@ -1,0 +1,225 @@
+/*
+ * st25r3916_regs.h — ST25R3916B register map, direct commands and SPI framing.
+ *
+ * Written from the ST datasheet DS13541 Rev 8 (ST25R3916B / ST25R3917B / ST25R3919B).
+ * These are facts about the chip (addresses, command codes, bit positions), transcribed
+ * from the datasheet, not from ST's RFAL middleware. Section/table references below point
+ * into DS13541 so every value can be re-checked against it.
+ *
+ * SPI (DS13541 §4.3.3): clock polarity 0, clock phase 1 (SPI mode 1), MSB first, active-low
+ * select. The first byte after select-low picks the operation (Table 12): the top two bits
+ * are the mode, the low six carry a register address or an operation selector.
+ */
+#ifndef PDA_DRV_ST25R3916_REGS_H
+#define PDA_DRV_ST25R3916_REGS_H
+
+/* ---- SPI operation-mode bytes (DS13541 Table 12) --------------------------------------- */
+#define ST25R_SPI_REG_WRITE(a) ((uint8_t)(0x00u | ((a) & 0x3Fu))) /* 00 + addr */
+#define ST25R_SPI_REG_READ(a)  ((uint8_t)(0x40u | ((a) & 0x3Fu))) /* 01 + addr */
+#define ST25R_SPI_FIFO_LOAD    0x80u                              /* 10 000000 */
+#define ST25R_SPI_FIFO_READ    0x9Fu                              /* 10 011111 */
+#define ST25R_SPI_PT_LOAD_A    0xA0u                              /* 10 100000 */
+#define ST25R_SPI_PT_LOAD_F    0xA8u                              /* 10 101000 */
+#define ST25R_SPI_PT_LOAD_TSN  0xACu                              /* 10 101100 */
+#define ST25R_SPI_PT_READ      0xBFu                              /* 10 111111 */
+/* Direct-command bytes already carry the 11 prefix (Table 14), sent as-is. */
+#define ST25R_SPI_SPACEB_PREFIX 0xFBu /* prefix a reg read/write to reach register space B */
+
+/* ---- Direct commands (DS13541 §4.4, Table 14) ------------------------------------------ */
+enum {
+    ST25R_CMD_SET_DEFAULT = 0xC1,       /* power-up state: stop, reset regs, clear collisions */
+    ST25R_CMD_STOP = 0xC2,              /* stop all activities (also clears FIFO) */
+    ST25R_CMD_TRANSMIT_WITH_CRC = 0xC4, /* TX, chip appends CRC */
+    ST25R_CMD_TRANSMIT_WITHOUT_CRC = 0xC5,
+    ST25R_CMD_TRANSMIT_REQA = 0xC6, /* ISO14443A REQA (7-bit short frame) */
+    ST25R_CMD_TRANSMIT_WUPA = 0xC7, /* ISO14443A WUPA */
+    ST25R_CMD_INITIAL_FIELD_ON = 0xC8,  /* reader: collision avoidance + field on */
+    ST25R_CMD_RESPONSE_FIELD_ON = 0xC9, /* target/active: response collision avoidance */
+    ST25R_CMD_GOTO_SENSE = 0xCD,        /* passive target -> Sense (Idle) */
+    ST25R_CMD_GOTO_SLEEP = 0xCE,        /* passive target -> Sleep (Halt) */
+    ST25R_CMD_MASK_RECEIVE_DATA = 0xD0,
+    ST25R_CMD_UNMASK_RECEIVE_DATA = 0xD1,
+    ST25R_CMD_AM_MOD_STATE = 0xD2,
+    ST25R_CMD_MEASURE_AMPLITUDE = 0xD3,
+    ST25R_CMD_RESET_RXGAIN = 0xD5,
+    ST25R_CMD_ADJUST_REGULATORS = 0xD6, /* set regulated voltages from the supply level */
+    ST25R_CMD_CALIBRATE_DRIVER_TIMING = 0xD8,
+    ST25R_CMD_MEASURE_PHASE = 0xD9,
+    ST25R_CMD_CLEAR_RSSI = 0xDA,
+    ST25R_CMD_CLEAR_FIFO = 0xDB,
+    ST25R_CMD_TRANSPARENT_MODE = 0xDC,
+    ST25R_CMD_MEASURE_POWER_SUPPLY = 0xDF,
+    ST25R_CMD_START_GP_TIMER = 0xE0,
+    ST25R_CMD_START_WAKEUP_TIMER = 0xE1,
+    ST25R_CMD_START_MASK_RECEIVE_TIMER = 0xE2,
+    ST25R_CMD_START_NO_RESPONSE_TIMER = 0xE3,
+    ST25R_CMD_START_PPON2_TIMER = 0xE4,
+    ST25R_CMD_STOP_NO_RESPONSE_TIMER = 0xE8,
+    ST25R_CMD_TRIGGER_RC_CALIBRATION = 0xEA,
+    ST25R_CMD_SPACE_B_ACCESS = 0xFB,
+    ST25R_CMD_TEST_ACCESS = 0xFC,
+};
+
+/* ---- Register space A addresses (DS13541 Table 18) ------------------------------------- */
+enum {
+    ST25R_REG_IO_CONF1 = 0x00,
+    ST25R_REG_IO_CONF2 = 0x01,
+    ST25R_REG_OP_CONTROL = 0x02,
+    ST25R_REG_MODE = 0x03,
+    ST25R_REG_BIT_RATE = 0x04,
+    ST25R_REG_ISO14443A_NFC = 0x05,
+    ST25R_REG_ISO14443B_1 = 0x06,
+    ST25R_REG_ISO14443B_FELICA = 0x07,
+    ST25R_REG_PASSIVE_TARGET = 0x08,
+    ST25R_REG_STREAM_MODE = 0x09,
+    ST25R_REG_AUX = 0x0A,
+    ST25R_REG_RX_CONF1 = 0x0B,
+    ST25R_REG_RX_CONF2 = 0x0C,
+    ST25R_REG_RX_CONF3 = 0x0D,
+    ST25R_REG_RX_CONF4 = 0x0E,
+    ST25R_REG_MASK_RX_TIMER = 0x0F,
+    ST25R_REG_NO_RESPONSE_TIMER1 = 0x10,
+    ST25R_REG_NO_RESPONSE_TIMER2 = 0x11,
+    ST25R_REG_TIMER_EMV_CONTROL = 0x12,
+    ST25R_REG_GPT1 = 0x13,
+    ST25R_REG_GPT2 = 0x14,
+    ST25R_REG_PPON2 = 0x15,
+    ST25R_REG_MASK_MAIN_IRQ = 0x16,
+    ST25R_REG_MASK_TIMER_NFC_IRQ = 0x17,
+    ST25R_REG_MASK_ERROR_WUP_IRQ = 0x18,
+    ST25R_REG_MASK_PASSIVE_TARGET_IRQ = 0x19,
+    ST25R_REG_MAIN_IRQ = 0x1A,
+    ST25R_REG_TIMER_NFC_IRQ = 0x1B,
+    ST25R_REG_ERROR_WUP_IRQ = 0x1C,
+    ST25R_REG_PASSIVE_TARGET_IRQ = 0x1D,
+    ST25R_REG_FIFO_STATUS1 = 0x1E,
+    ST25R_REG_FIFO_STATUS2 = 0x1F,
+    ST25R_REG_COLLISION = 0x20,
+    ST25R_REG_PASSIVE_TARGET_STATUS = 0x21,
+    ST25R_REG_NUM_TX_BYTES1 = 0x22,
+    ST25R_REG_NUM_TX_BYTES2 = 0x23,
+    ST25R_REG_BIT_RATE_DETECT = 0x24,
+    ST25R_REG_AD_RESULT = 0x25,
+    ST25R_REG_ANT_TUNE1 = 0x26,
+    ST25R_REG_ANT_TUNE2 = 0x27,
+    ST25R_REG_TX_DRIVER = 0x28,
+    ST25R_REG_PT_MOD = 0x29,
+    ST25R_REG_FIELD_ON_THRESHOLD = 0x2A,  /* external field detector activation threshold */
+    ST25R_REG_FIELD_OFF_THRESHOLD = 0x2B, /* external field detector deactivation threshold */
+    ST25R_REG_REGULATOR_CONTROL = 0x2C,
+    ST25R_REG_RSSI = 0x2D,
+    ST25R_REG_GAIN_REDUCTION = 0x2E,
+    ST25R_REG_AUX_DISPLAY = 0x31,
+    ST25R_REG_WAKEUP_TIMER_CONTROL = 0x32,
+    ST25R_REG_AMPLITUDE_MEAS_CONF = 0x33,
+    ST25R_REG_AMPLITUDE_MEAS_REF = 0x34,
+    ST25R_REG_AMPLITUDE_MEAS_AA_DISPLAY = 0x35,
+    ST25R_REG_AMPLITUDE_MEAS_DISPLAY = 0x36,
+    ST25R_REG_PHASE_MEAS_CONF = 0x37,
+    ST25R_REG_PHASE_MEAS_REF = 0x38,
+    ST25R_REG_PHASE_MEAS_AA_DISPLAY = 0x39,
+    ST25R_REG_PHASE_MEAS_DISPLAY = 0x3A,
+    ST25R_REG_IC_IDENTITY = 0x3F,
+};
+
+/* ---- Register space B addresses (DS13541 Table 19; reach them via the 0xFB prefix) ------ */
+enum {
+    ST25R_REGB_EMD_SUPPRESSION = 0x05,
+    ST25R_REGB_SUBC_START_TIMER = 0x06,
+    ST25R_REGB_P2P_RX_CONF = 0x0B,
+    ST25R_REGB_CORR_CONF1 = 0x0C,
+    ST25R_REGB_CORR_CONF2 = 0x0D,
+    ST25R_REGB_SQUELCH_TIMER = 0x0F,
+    ST25R_REGB_FIELD_ON_GT = 0x15,
+    ST25R_REGB_AUX_MOD = 0x28,
+    ST25R_REGB_TX_DRIVER_TIMING = 0x29,
+    ST25R_REGB_RES_AM_MOD = 0x2A,
+    ST25R_REGB_TX_DRIVER_STATUS = 0x2B,
+    ST25R_REGB_REGULATOR_DISPLAY = 0x2C,
+    ST25R_REGB_OVERSHOOT_CONF1 = 0x30,
+    ST25R_REGB_OVERSHOOT_CONF2 = 0x31,
+    ST25R_REGB_UNDERSHOOT_CONF1 = 0x32,
+    ST25R_REGB_UNDERSHOOT_CONF2 = 0x33,
+};
+
+/* ---- IO configuration register 1 (0x00, DS13541 Table 20) ------------------------------ */
+#define ST25R_IO_CONF1_SINGLE (1u << 7) /* single-ended (one RFO) vs differential driving */
+#define ST25R_IO_CONF1_RFO2 (1u << 6)
+#define ST25R_IO_CONF1_OUT_CL_SHIFT 1 /* MCU_CLK output frequency select (out_cl1:0) */
+#define ST25R_IO_CONF1_LF_CLK_OFF (1u << 0)
+
+/* ---- Operation control register (0x02, DS13541 Table 22) ------------------------------- */
+#define ST25R_OP_EN (1u << 7)       /* enable oscillator + regulator (Ready) */
+#define ST25R_OP_RX_EN (1u << 6)    /* enable receivers */
+#define ST25R_OP_RX_CHN (1u << 5)   /* one Rx channel only */
+#define ST25R_OP_RX_MAN (1u << 4)   /* manual Rx channel select */
+#define ST25R_OP_TX_EN (1u << 3)    /* enable transmitter (field) */
+#define ST25R_OP_WU (1u << 2)       /* enable wake-up mode */
+#define ST25R_OP_EN_FD_C1 (1u << 1) /* external field detector config, high bit */
+#define ST25R_OP_EN_FD_C0 (1u << 0)
+
+/* ---- Mode definition register (0x03, DS13541 Table 23/24/25) --------------------------- */
+#define ST25R_MODE_TARG (1u << 7)  /* 0 initiator, 1 target */
+#define ST25R_MODE_OM_SHIFT 3      /* om3:0 operation mode */
+#define ST25R_MODE_OM_MASK (0xFu << 3)
+#define ST25R_MODE_TR_AM (1u << 2) /* 0 OOK, 1 AM modulation */
+#define ST25R_MODE_NFC_AR_SHIFT 0  /* automatic response RF collision avoidance */
+/* Initiator om values (Table 24) */
+#define ST25R_OM_NFCIP1_ACTIVE 0x0
+#define ST25R_OM_ISO14443A 0x1
+#define ST25R_OM_ISO14443B 0x2
+#define ST25R_OM_FELICA 0x3
+#define ST25R_OM_TOPAZ 0x4
+/* Target om values (Table 25): ISO14443A passive target = 0x1, FeliCa passive = 0x4 */
+
+/* ---- Interrupt registers: main 0x1A (Table 62), timer/NFC 0x1B (Table 63),
+ *      error/wake-up 0x1C (Table 64). The masks at 0x16..0x18 share the same bit layout.
+ *      Reading 0x1A..0x1D (auto-increment, 4 bytes) returns and clears all pending IRQs. */
+/* Main (0x1A) */
+#define ST25R_IRQ_OSC (1u << 7)     /* oscillator frequency stable */
+#define ST25R_IRQ_WL (1u << 6)      /* FIFO water level */
+#define ST25R_IRQ_RXS (1u << 5)     /* start of receive */
+#define ST25R_IRQ_RXE (1u << 4)     /* end of receive */
+#define ST25R_IRQ_TXE (1u << 3)     /* end of transmission */
+#define ST25R_IRQ_COL (1u << 2)     /* bit collision */
+#define ST25R_IRQ_RX_REST (1u << 1) /* automatic reception restart */
+/* Timer and NFC (0x1B) */
+#define ST25R_IRQ_DCT (1u << 7)  /* direct command terminated */
+#define ST25R_IRQ_NRE (1u << 6)  /* no-response timer expired */
+#define ST25R_IRQ_GPE (1u << 5)  /* general-purpose timer expired */
+#define ST25R_IRQ_EON (1u << 4)  /* external field > target activation level */
+#define ST25R_IRQ_EOF (1u << 3)  /* external field dropped below level */
+#define ST25R_IRQ_CAC (1u << 2)  /* collision during RF collision avoidance */
+#define ST25R_IRQ_CAT (1u << 1)  /* minimum guard time expired (field switched on) */
+#define ST25R_IRQ_NFCT (1u << 0) /* target: initiator bit rate recognized */
+/* Error and wake-up (0x1C) */
+#define ST25R_IRQ_CRC (1u << 7)  /* CRC error */
+#define ST25R_IRQ_PAR (1u << 6)  /* parity error */
+#define ST25R_IRQ_ERR2 (1u << 5) /* soft framing error */
+#define ST25R_IRQ_ERR1 (1u << 4) /* hard framing error */
+#define ST25R_IRQ_WT (1u << 3)   /* wake-up timer */
+#define ST25R_IRQ_WAM (1u << 2)  /* wake-up: amplitude measurement */
+#define ST25R_IRQ_WPH (1u << 1)  /* wake-up: phase measurement */
+
+/* The four interrupt registers form one 32-bit set, LSB = main (0x1A). */
+#define ST25R_IRQ_MAIN(v) ((uint8_t)((v) & 0xFFu))
+#define ST25R_IRQ_TIMER_NFC(v) ((uint8_t)(((v) >> 8) & 0xFFu))
+#define ST25R_IRQ_ERROR_WUP(v) ((uint8_t)(((v) >> 16) & 0xFFu))
+#define ST25R_IRQ_PASSIVE(v) ((uint8_t)(((v) >> 24) & 0xFFu))
+
+/* ---- FIFO status registers (0x1E/0x1F, DS13541 Table 66/67) ---------------------------- */
+#define ST25R_FIFO2_B9_B8_SHIFT 6 /* FIFO byte-count MSBs are bits 7:6 of 0x1F */
+#define ST25R_FIFO2_UNDERFLOW (1u << 5)
+#define ST25R_FIFO2_OVERFLOW (1u << 4)
+#define ST25R_FIFO2_LB_SHIFT 1 /* bits in the last byte if incomplete (fifo_lb2:0) */
+#define ST25R_FIFO2_LB_MASK (0x7u << 1)
+#define ST25R_FIFO2_NP_LB (1u << 0) /* parity bit missing in the last byte */
+#define ST25R_FIFO_DEPTH 512
+
+/* ---- IC identity register (0x3F, DS13541 Table 121) ------------------------------------ */
+#define ST25R_IC_TYPE_SHIFT 3
+#define ST25R_IC_TYPE_MASK (0x1Fu << 3)
+#define ST25R_IC_TYPE_ST25R3916B 0x06 /* 00110b; the ST25R3916 (non-B) reads 0x05 */
+#define ST25R_IC_REV_MASK 0x07u
+
+#endif
