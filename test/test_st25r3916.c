@@ -32,6 +32,10 @@ static uint8_t g_atqa[2];
 static uint8_t g_sak_final;
 static bool g_card_present;
 
+/* Listen (card-emulation) mode: PT_Memory the host loaded into us. */
+static uint8_t g_pt[16];
+static int g_pt_len;
+
 #define FI_M(bit) ((uint32_t)(bit))
 #define FI_T(bit) ((uint32_t)(bit) << 8)
 
@@ -174,6 +178,14 @@ static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
         if (rx) {
             memcpy(rx + 1, g_fifo, n - 1);
         }
+        return;
+    }
+    if (op == ST25R_SPI_PT_LOAD_A) { /* load PT_Memory (card-emulation identity) */
+        g_pt_len = (int)(n - 1);
+        if (g_pt_len > (int)sizeof(g_pt)) {
+            g_pt_len = sizeof(g_pt);
+        }
+        memcpy(g_pt, tx + 1, g_pt_len);
         return;
     }
     if ((op & 0xC0) == 0xC0) { /* direct command */
@@ -344,6 +356,59 @@ int main(void)
     uint8_t tiny[2];
     CHECK_EQ(st25r3916_transceive(&d, sel, 16, ST25R_TX_ANTICOL, tiny, sizeof(tiny), NULL, 20),
              ST25R_ERR_NOMEM); /* the 5-byte answer does not fit 2 bytes */
+
+    /* ================= Listen mode (card emulation) ================= */
+    reset_chip();
+    g_card_present = false;
+    g_pt_len = 0;
+
+    /* ---- start as a 4-byte-UID NFC-A tag: PT_Memory and mode registers are set ---- */
+    st25r_nfca_target_t tgt = {
+        .nfcid1 = {0x08, 0xDE, 0xAD, 0xBE}, .nfcid1_len = 4, .atqa = {0x44, 0x00}, .sak = 0x20};
+    CHECK_EQ(st25r3916_listen_start(&d, &tgt), ST25R_OK);
+    CHECK(!memcmp(&g_pt[ST25R_PT_OFF_NFCID1], tgt.nfcid1, 4));
+    CHECK_EQ(g_pt[ST25R_PT_OFF_SENS_RES], 0x44);     /* ATQA */
+    CHECK_EQ(g_pt[ST25R_PT_OFF_SELR_L1], 0x20);      /* SAK, single cascade level */
+    CHECK_EQ(g_rega[ST25R_REG_MODE], ST25R_MODE_TARG | (ST25R_OM_ISO14443A << ST25R_MODE_OM_SHIFT));
+    CHECK_EQ(g_rega[ST25R_REG_PASSIVE_TARGET], 2u << ST25R_PT_FDEL_SHIFT);
+    CHECK((g_rega[ST25R_REG_OP_CONTROL] & ST25R_OP_RX_EN));
+    CHECK_EQ(g_rega[ST25R_REG_OP_CONTROL] & ST25R_OP_EN_FD_MASK, ST25R_OP_EN_FD_AUTO);
+    CHECK_EQ(g_last_cmd, ST25R_CMD_GOTO_SENSE);
+
+    /* ---- a reader selects us: the chip raises I_wu_a -> ACTIVATED ---- */
+    g_irq |= (uint32_t)ST25R_IRQ_WU_A << 24;
+    int rlen = -1;
+    uint8_t rbuf[32];
+    CHECK_EQ(st25r3916_listen_poll(&d, rbuf, sizeof(rbuf), &rlen, 20), ST25R_LISTEN_ACTIVATED);
+
+    /* ---- the reader sends a frame (e.g. RATS): I_rxe + the frame in the FIFO -> RECEIVED ---- */
+    uint8_t rats[] = {0xE0, 0x80};
+    memcpy(g_fifo, rats, sizeof(rats));
+    g_fifo_len = sizeof(rats);
+    g_irq |= FI_M(ST25R_IRQ_RXE);
+    CHECK_EQ(st25r3916_listen_poll(&d, rbuf, sizeof(rbuf), &rlen, 20), ST25R_LISTEN_RECEIVED);
+    CHECK_EQ(rlen, (int)sizeof(rats));
+    CHECK(!memcmp(rbuf, rats, sizeof(rats)));
+
+    /* ---- we answer (e.g. ATS): the bytes reach the FIFO and a transmit is issued ---- */
+    uint8_t ats[] = {0x05, 0x78, 0x80, 0x70, 0x02};
+    CHECK_EQ(st25r3916_listen_respond(&d, ats, sizeof(ats), true, 20), ST25R_OK);
+    CHECK_EQ(g_txlen, (int)sizeof(ats));
+    CHECK(!memcmp(g_txbuf, ats, sizeof(ats)));
+
+    /* ---- 7-byte-UID tag: level-1 SAK carries the cascade bit, level 2 is final ---- */
+    st25r_nfca_target_t tgt7 = {.nfcid1 = {0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66},
+                                .nfcid1_len = 7,
+                                .atqa = {0x44, 0x00},
+                                .sak = 0x00};
+    CHECK_EQ(st25r3916_listen_start(&d, &tgt7), ST25R_OK);
+    CHECK(!memcmp(&g_pt[ST25R_PT_OFF_NFCID1], tgt7.nfcid1, 7));
+    CHECK_EQ(g_pt[ST25R_PT_OFF_SELR_L1], 0x04); /* cascade bit set */
+    CHECK_EQ(g_pt[ST25R_PT_OFF_SELR_L2], 0x00); /* final SAK */
+
+    /* ---- a bad NFCID1 length is rejected ---- */
+    st25r_nfca_target_t bad = {.nfcid1_len = 5};
+    CHECK_EQ(st25r3916_listen_start(&d, &bad), ST25R_ERR_PARAM);
 
     TEST_MAIN_END();
 }

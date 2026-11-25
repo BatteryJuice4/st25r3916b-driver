@@ -397,3 +397,134 @@ int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
     }
     return ST25R_ERR_FRAMING; /* ran out of cascade levels without completing */
 }
+
+/* ===== RF: ISO 14443-A card emulation (listen / target mode, DS13541 §4.2.14) ==========
+ * UNTESTED ON HARDWARE. See the header for the contract and caveats. */
+
+/* Load PT_Memory from location 0 (NFC-A config area) via the dedicated SPI operation. */
+static void load_pt_memory_a(st25r_t *d, const uint8_t *data, size_t n)
+{
+    uint8_t buf[1 + ST25R_PT_NFCA_LEN];
+    if (n > ST25R_PT_NFCA_LEN) {
+        n = ST25R_PT_NFCA_LEN;
+    }
+    buf[0] = ST25R_SPI_PT_LOAD_A;
+    memcpy(&buf[1], data, n);
+    d->bus->txn(d->bus->ctx, buf, NULL, 1 + n);
+}
+
+int st25r3916_listen_start(st25r_t *d, const st25r_nfca_target_t *t)
+{
+    if (!t || (t->nfcid1_len != 4 && t->nfcid1_len != 7)) {
+        return ST25R_ERR_PARAM;
+    }
+
+    st25r3916_cmd(d, ST25R_CMD_SET_DEFAULT);
+    if (d->bus->delay_us) {
+        d->bus->delay_us(d->bus->ctx, 1000);
+    }
+
+    /* Enable the oscillator/regulators (needed to load-modulate replies) and wait for it. */
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_EN, ST25R_OP_EN);
+    int tries = 0;
+    while (!(st25r3916_read_reg(d, ST25R_REG_AUX_DISPLAY) & ST25R_AUX_OSC_OK)) {
+        if (d->bus->delay_us) {
+            d->bus->delay_us(d->bus->ctx, 100);
+        }
+        if (++tries > 100) {
+            return ST25R_ERR_TIMEOUT;
+        }
+    }
+
+    /* PT_Memory: NFCID1, SENS_RES (ATQA) and the SEL_RES (SAK) for each cascade level. For a
+     * 7-byte UID, level 1's SAK carries the cascade bit and level 2's is the final SAK. */
+    uint8_t pt[ST25R_PT_NFCA_LEN];
+    memset(pt, 0, sizeof(pt));
+    memcpy(&pt[ST25R_PT_OFF_NFCID1], t->nfcid1, t->nfcid1_len);
+    pt[ST25R_PT_OFF_SENS_RES] = t->atqa[0];
+    pt[ST25R_PT_OFF_SENS_RES + 1] = t->atqa[1];
+    if (t->nfcid1_len == 4) {
+        pt[ST25R_PT_OFF_SELR_L1] = t->sak;
+    } else {
+        pt[ST25R_PT_OFF_SELR_L1] = (uint8_t)(t->sak | 0x04); /* cascade bit */
+        pt[ST25R_PT_OFF_SELR_L2] = t->sak;
+    }
+    load_pt_memory_a(d, pt, sizeof(pt));
+
+    /* Automatic NFC-A anticollision with the recommended FDT compensation (fdel = 2). */
+    st25r3916_write_reg(d, ST25R_REG_PASSIVE_TARGET, (uint8_t)(2u << ST25R_PT_FDEL_SHIFT));
+    /* NFC-A passive target mode at 106 kbit/s. */
+    st25r3916_write_reg(d, ST25R_REG_MODE,
+                        (uint8_t)(ST25R_MODE_TARG | (ST25R_OM_ISO14443A << ST25R_MODE_OM_SHIFT)));
+    st25r3916_write_reg(d, ST25R_REG_BIT_RATE,
+                        (uint8_t)((ST25R_BR_106 << ST25R_BR_TX_SHIFT) | (ST25R_BR_106 << ST25R_BR_RX_SHIFT)));
+    /* Receiver on, automatic external field detector (required for passive target). */
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_RX_EN | ST25R_OP_EN_FD_MASK,
+                         ST25R_OP_RX_EN | ST25R_OP_EN_FD_AUTO);
+
+    /* Go to the Sense (idle) state to wait for a reader's REQA. */
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, ST25R_CMD_GOTO_SENSE);
+    return ST25R_OK;
+}
+
+void st25r3916_listen_stop(st25r_t *d)
+{
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    st25r3916_write_reg(d, ST25R_REG_MODE, 0); /* back to initiator */
+    st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL,
+                         ST25R_OP_EN | ST25R_OP_RX_EN | ST25R_OP_TX_EN | ST25R_OP_EN_FD_MASK, 0);
+}
+
+st25r_listen_event_t st25r3916_listen_poll(st25r_t *d, uint8_t *rx, int rx_cap, int *rx_len,
+                                           int timeout_ms)
+{
+    uint32_t want = IRQ_M(ST25R_IRQ_RXE) | ((uint32_t)(ST25R_IRQ_WU_A | ST25R_IRQ_RXE_PTA) << 24) |
+                    IRQ_T(ST25R_IRQ_EOF);
+    uint32_t irq = wait_irqs(d, want, timeout_ms);
+
+    if (irq & IRQ_T(ST25R_IRQ_EOF)) {
+        return ST25R_LISTEN_FIELD_OFF; /* the reader's field dropped */
+    }
+    /* A received higher-layer frame (I_rxe, or I_rxe_pta after the auto anticollision). */
+    if ((irq & IRQ_M(ST25R_IRQ_RXE)) || (irq & ((uint32_t)ST25R_IRQ_RXE_PTA << 24))) {
+        uint8_t fs[2];
+        st25r3916_read_regs(d, ST25R_REG_FIFO_STATUS1, fs, 2);
+        int count = fs[0] | ((fs[1] >> ST25R_FIFO2_B9_B8_SHIFT) << 8);
+        if (count > 0 && rx) {
+            if (count > rx_cap) {
+                count = rx_cap;
+            }
+            st25r3916_read_fifo(d, rx, (size_t)count);
+        }
+        if (rx_len) {
+            *rx_len = count;
+        }
+        if (count > 0) {
+            return ST25R_LISTEN_RECEIVED;
+        }
+    }
+    if (irq & ((uint32_t)ST25R_IRQ_WU_A << 24)) {
+        return ST25R_LISTEN_ACTIVATED; /* selected, no higher-layer frame yet */
+    }
+    return ST25R_LISTEN_NONE;
+}
+
+int st25r3916_listen_respond(st25r_t *d, const uint8_t *tx, int tx_len, bool with_crc,
+                             int timeout_ms)
+{
+    if (tx_len < 0 || tx_len > ST25R_FIFO_DEPTH) {
+        return ST25R_ERR_PARAM;
+    }
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, ST25R_NTX1(tx_len));
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, ST25R_NTX2(tx_len, 0));
+    if (tx_len > 0) {
+        st25r3916_write_fifo(d, tx, (size_t)tx_len);
+    }
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, with_crc ? ST25R_CMD_TRANSMIT_WITH_CRC : ST25R_CMD_TRANSMIT_WITHOUT_CRC);
+    if (!(wait_irqs(d, IRQ_M(ST25R_IRQ_TXE), timeout_ms) & IRQ_M(ST25R_IRQ_TXE))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+    return ST25R_OK;
+}

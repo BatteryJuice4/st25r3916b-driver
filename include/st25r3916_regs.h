@@ -157,6 +157,8 @@ enum {
 #define ST25R_OP_WU (1u << 2)       /* enable wake-up mode */
 #define ST25R_OP_EN_FD_C1 (1u << 1) /* external field detector config, high bit */
 #define ST25R_OP_EN_FD_C0 (1u << 0)
+#define ST25R_OP_EN_FD_MASK (0x3u << 0) /* en_fd_c1:0 */
+#define ST25R_OP_EN_FD_AUTO (0x3u << 0) /* 11: automatic field detector (passive target/AP2P) */
 
 /* ---- Mode definition register (0x03, DS13541 Table 23/24/25) --------------------------- */
 #define ST25R_MODE_TARG (1u << 7)  /* 0 initiator, 1 target */
@@ -201,6 +203,25 @@ enum {
 #define ST25R_AUX_RX_ON (1u << 3)  /* receive decoder enabled */
 #define ST25R_AUX_RX_ACT (1u << 2) /* receiving a message */
 
+/* ---- NFCIP-1 passive target definition register (0x08, DS13541 Table 33) ---------------
+ * Card-emulation / listen mode. fdel3:0 is the PCD-to-PICC FDT compensation (2 is the
+ * recommended value). The d_* bits DISABLE the chip's automatic responses when set, so 0
+ * keeps automatic NFC-A anticollision and the NFC-F SENSF_RES on. */
+#define ST25R_PT_FDEL_SHIFT 4
+#define ST25R_PT_D_AC_AP2P (1u << 3)   /* 1 disables AP2P frame recognition */
+#define ST25R_PT_D_212_424 (1u << 2)   /* 1 disables automatic SENSF_RES (NFC-F) */
+#define ST25R_PT_D_106_AC_A (1u << 0)  /* 1 disables automatic NFC-A anticollision */
+
+/* ---- PT_Memory layout (DS13541 Table 8), loaded via ST25R_SPI_PT_LOAD_A from location 0 --
+ * NFC-A card-emulation responses: NFCID1 (UID), SENS_RES (ATQA) and the SEL_RES (SAK) for
+ * each cascade level. 15 bytes cover the NFC-A set. */
+#define ST25R_PT_OFF_NFCID1 0 /* locations 0..9: NFCID1 (4 or 7 UID bytes) */
+#define ST25R_PT_OFF_SENS_RES 10 /* locations 10,11: SENS_RES (ATQA) */
+#define ST25R_PT_OFF_SELR_L1 12  /* location 12: SEL level 1 response (SAK) */
+#define ST25R_PT_OFF_SELR_L2 13  /* location 13: SEL level 2 response */
+#define ST25R_PT_OFF_SELR_L3 14  /* location 14: SEL level 3 response (RFU for NFC-A) */
+#define ST25R_PT_NFCA_LEN 15     /* bytes written for an NFC-A target */
+
 /* ---- Interrupt registers: main 0x1A (Table 62), timer/NFC 0x1B (Table 63),
  *      error/wake-up 0x1C (Table 64). The masks at 0x16..0x18 share the same bit layout.
  *      Reading 0x1A..0x1D (auto-increment, 4 bytes) returns and clears all pending IRQs. */
@@ -229,6 +250,14 @@ enum {
 #define ST25R_IRQ_WT (1u << 3)   /* wake-up timer */
 #define ST25R_IRQ_WAM (1u << 2)  /* wake-up: amplitude measurement */
 #define ST25R_IRQ_WPH (1u << 1)  /* wake-up: phase measurement */
+/* Passive target (0x1D, Table 65) — card-emulation / listen mode */
+#define ST25R_IRQ_PPON2 (1u << 7)   /* PPON2 field-on waiting timer */
+#define ST25R_IRQ_SL_WL (1u << 6)   /* passive target slot-number water level */
+#define ST25R_IRQ_APON (1u << 5)    /* active P2P field-on event */
+#define ST25R_IRQ_RXE_PTA (1u << 4) /* end of receive; chip handled the auto response */
+#define ST25R_IRQ_WU_F (1u << 3)    /* NFC-F 212/424 passive target Active */
+#define ST25R_IRQ_WU_AX (1u << 1)   /* passive target Active* state reached */
+#define ST25R_IRQ_WU_A (1u << 0)    /* passive target Active state reached (selected) */
 
 /* The four interrupt registers form one 32-bit set, LSB = main (0x1A). */
 #define ST25R_IRQ_MAIN(v) ((uint8_t)((v) & 0xFFu))

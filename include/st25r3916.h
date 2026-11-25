@@ -138,4 +138,45 @@ int st25r3916_nfca_request(st25r_t *d, uint8_t atqa[2], bool wupa);
  * collisions), or another negative ST25R_ERR_*. */
 int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out);
 
+/* ---- RF: ISO 14443-A card emulation (listen / target mode) -----------------------------
+ *
+ * UNTESTED ON HARDWARE. The chip answers REQA, anticollision and SELECT automatically from
+ * PT_Memory (DS13541 §4.2.14, Table 8/33); the host loads the identity, then waits for the
+ * reader to select the card and handles the higher-layer frames (RATS/APDU) itself.
+ */
+
+/* The identity this device presents as an NFC-A tag. */
+typedef struct {
+    uint8_t nfcid1[7]; /* UID; the reader-visible NFCID1 */
+    uint8_t nfcid1_len; /* 4 or 7 */
+    uint8_t atqa[2];    /* SENS_RES answered to REQA/WUPA */
+    uint8_t sak;        /* SEL_RES (SAK) of the final cascade level */
+} st25r_nfca_target_t;
+
+typedef enum {
+    ST25R_LISTEN_NONE = 0,   /* nothing happened before the timeout */
+    ST25R_LISTEN_ACTIVATED,  /* a reader completed anticollision and selected this card */
+    ST25R_LISTEN_RECEIVED,   /* a reader frame is in `rx` (rx_len bytes) and needs a reply */
+    ST25R_LISTEN_FIELD_OFF,  /* the reader's field went away */
+} st25r_listen_event_t;
+
+/* Enter NFC-A card emulation: load PT_Memory with `t`, configure passive-target mode with
+ * automatic anticollision, enable the external field detector and go to the Sense state to
+ * wait for a reader. Returns ST25R_OK or a negative ST25R_ERR_*. */
+int st25r3916_listen_start(st25r_t *d, const st25r_nfca_target_t *t);
+
+/* Leave listen mode and return the chip to idle. */
+void st25r3916_listen_stop(st25r_t *d);
+
+/* Wait up to `timeout_ms` for a listen-mode event. On ST25R_LISTEN_RECEIVED the reader's
+ * frame is copied into `rx` (capacity `rx_cap`) and its length put in `*rx_len` (may be
+ * NULL). Reply to it with st25r3916_listen_respond(). */
+st25r_listen_event_t st25r3916_listen_poll(st25r_t *d, uint8_t *rx, int rx_cap, int *rx_len,
+                                           int timeout_ms);
+
+/* Send a higher-layer response frame (e.g. ATS, an APDU reply) back to the reader while in
+ * listen mode. `with_crc` appends the ISO 14443 CRC. Returns ST25R_OK or a negative error. */
+int st25r3916_listen_respond(st25r_t *d, const uint8_t *tx, int tx_len, bool with_crc,
+                             int timeout_ms);
+
 #endif

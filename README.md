@@ -35,16 +35,21 @@ microcontroller.
   full ISO 14443-A anticollision + SELECT cascade (levels 1–3) for a single card, returning
   the UID (4/7/10 bytes), ATQA and SAK. The unit test drives it against a fake card that
   answers both 4- and 7-byte-UID cascades.
+- **NFC-A card emulation** (`st25r3916_listen_start` / `listen_poll` / `listen_respond` /
+  `listen_stop`): act as a tag. The chip answers REQA, anticollision and SELECT automatically
+  from PT_Memory (loaded with the NFCID1/ATQA/SAK, 4- or 7-byte UID); the host is notified
+  when a reader selects the card, then handles the higher-layer frames (RATS/APDU) over the
+  FIFO. Exercised in the unit test against a fake reader.
 
 **Not implemented yet** (contributions welcome — these need the datasheet's analog/RF
 sections and, to be trusted, a real chip):
 
 - The **analog-config register values** (receiver, modulation, regulators) — those depend on
-  your antenna and matching network, so `field_on` leaves the reset defaults in place.
+  your antenna and matching network, so the RF calls leave the reset defaults in place.
 - **Multi-card collision resolution** (the current anticollision reads a single card and
   reports `ST25R_ERR_COLLISION` when more than one answers).
-- Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz polling.
-- Card emulation (target / listen mode).
+- Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz, as reader or
+  as a target.
 - Low-power card detection (wake-up mode).
 
 ## Using it
@@ -96,6 +101,7 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_field_on` / `field_off` | Power up to Ready and switch the RF field on/off |
 | `st25r3916_transceive` | Send/receive a frame (CRC, parity, anticollision flags) |
 | `st25r3916_nfca_request` / `nfca_select` | REQA/WUPA and the ISO 14443-A UID cascade |
+| `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_stop` | NFC-A card emulation |
 
 The RF calls expect the chip's IRQ pin wired to an optional `st25r_bus_t.wait_irq` callback
 (they poll the interrupt registers if it is `NULL`). They return `ST25R_OK` or a negative
