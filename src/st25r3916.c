@@ -128,6 +128,30 @@ bool st25r3916_probe(st25r_t *d)
     return d->ic_type == ST25R_IC_TYPE_ST25R3916B;
 }
 
+void st25r3916_set_analog_config(st25r_t *d, const st25r_analog_config_t *cfg)
+{
+    d->analog = cfg;
+}
+
+void st25r3916_apply_analog_config(st25r_t *d, st25r_analog_event_t event)
+{
+    if (!d->analog || !d->analog->entries) {
+        return;
+    }
+    for (size_t i = 0; i < d->analog->count; i++) {
+        const st25r_analog_entry_t *e = &d->analog->entries[i];
+        if (e->event != (uint8_t)event) {
+            continue;
+        }
+        if (e->spaceb) {
+            uint8_t v = st25r3916_read_regb(d, e->reg);
+            st25r3916_write_regb(d, e->reg, (uint8_t)((v & ~e->mask) | (e->value & e->mask)));
+        } else {
+            st25r3916_modify_reg(d, e->reg, e->mask, e->value);
+        }
+    }
+}
+
 /* ===== RF: power-up and ISO 14443-A reader (DS13541 §4.2.13) ============================
  * UNTESTED ON HARDWARE. See the header for the contract and caveats. */
 
@@ -189,6 +213,7 @@ int st25r3916_field_on(st25r_t *d)
             return ST25R_ERR_TIMEOUT;
         }
     }
+    st25r3916_apply_analog_config(d, ST25R_ANALOG_POWER_UP);
 
     /* NFC-A reader at 106 kbit/s: initiator, ISO14443A, standard framing. */
     st25r3916_write_reg(d, ST25R_REG_MODE, (uint8_t)(ST25R_OM_ISO14443A << ST25R_MODE_OM_SHIFT));
@@ -203,6 +228,7 @@ int st25r3916_field_on(st25r_t *d)
     /* Enable the receiver and transmitter. */
     st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_RX_EN | ST25R_OP_TX_EN,
                          ST25R_OP_RX_EN | ST25R_OP_TX_EN);
+    st25r3916_apply_analog_config(d, ST25R_ANALOG_POLL_A); /* Rx/Tx analog for the antenna */
 
     /* Switch the field on with initial RF collision avoidance (does not transmit if another
      * reader's field is already present). I_cat means the field is on and the minimum guard
@@ -435,6 +461,7 @@ int st25r3916_listen_start(st25r_t *d, const st25r_nfca_target_t *t)
             return ST25R_ERR_TIMEOUT;
         }
     }
+    st25r3916_apply_analog_config(d, ST25R_ANALOG_POWER_UP);
 
     /* PT_Memory: NFCID1, SENS_RES (ATQA) and the SEL_RES (SAK) for each cascade level. For a
      * 7-byte UID, level 1's SAK carries the cascade bit and level 2's is the final SAK. */
@@ -461,6 +488,7 @@ int st25r3916_listen_start(st25r_t *d, const st25r_nfca_target_t *t)
     /* Receiver on, automatic external field detector (required for passive target). */
     st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_RX_EN | ST25R_OP_EN_FD_MASK,
                          ST25R_OP_RX_EN | ST25R_OP_EN_FD_AUTO);
+    st25r3916_apply_analog_config(d, ST25R_ANALOG_LISTEN_A);
 
     /* Go to the Sense (idle) state to wait for a reader's REQA. */
     st25r3916_get_interrupts(d);
@@ -568,6 +596,7 @@ int st25r3916_wakeup_start(st25r_t *d, const st25r_wakeup_cfg_t *cfg)
     if (rc != ST25R_OK) {
         return rc;
     }
+    st25r3916_apply_analog_config(d, ST25R_ANALOG_POWER_UP);
 
     if (cfg->measure_amplitude) {
         uint8_t conf = (uint8_t)((cfg->am_delta << ST25R_MEAS_D_SHIFT) |
@@ -593,6 +622,7 @@ int st25r3916_wakeup_start(st25r_t *d, const st25r_wakeup_cfg_t *cfg)
                             (cfg->measure_amplitude ? ST25R_WUT_WAM : 0) |
                             (cfg->measure_phase ? ST25R_WUT_WPH : 0));
     st25r3916_write_reg(d, ST25R_REG_WAKEUP_TIMER_CONTROL, wut);
+    st25r3916_apply_analog_config(d, ST25R_ANALOG_WAKEUP);
 
     /* Let only the wake sources (I_wam / I_wph / I_wt) reach the IRQ pin. */
     uint32_t keep = ST25R_IRQ_WAM | ST25R_IRQ_WPH | ST25R_IRQ_WT;

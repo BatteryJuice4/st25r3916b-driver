@@ -36,10 +36,43 @@ typedef struct {
     bool (*wait_irq)(void *ctx, int timeout_ms);
 } st25r_bus_t;
 
+/* ---- Analog configuration table --------------------------------------------------------
+ *
+ * The receiver, modulation and regulator settings that make the RF actually work depend on
+ * your antenna and matching network, so the driver does not hardcode them. Instead a board
+ * supplies a table of register tweaks to apply at each RF event; the driver's reset defaults
+ * are used for anything the table leaves alone. Derive the values from the datasheet's
+ * receiver/modulation registers and tune them against your antenna (ST's reference-antenna
+ * numbers from RFAL are a starting point, but they are ST's and are not reproduced here).
+ */
+typedef enum {
+    ST25R_ANALOG_POWER_UP = 0, /* oscillator ready: chip-level analog (regulators, Rx) */
+    ST25R_ANALOG_POLL_A,       /* NFC-A reader: Rx gain/threshold, Tx modulation */
+    ST25R_ANALOG_LISTEN_A,     /* NFC-A card emulation */
+    ST25R_ANALOG_WAKEUP,       /* wake-up measurement tuning */
+    ST25R_ANALOG_EVENT_COUNT,
+} st25r_analog_event_t;
+
+/* One register tweak: at `event`, reg = (reg & ~mask) | (value & mask), in space A, or space
+ * B when `spaceb` is set. */
+typedef struct {
+    uint8_t event;  /* an st25r_analog_event_t */
+    uint8_t reg;
+    uint8_t mask;
+    uint8_t value;
+    uint8_t spaceb; /* 0: register space A, 1: space B */
+} st25r_analog_entry_t;
+
+typedef struct {
+    const st25r_analog_entry_t *entries;
+    size_t count;
+} st25r_analog_config_t;
+
 typedef struct {
     const st25r_bus_t *bus;
     uint8_t ic_type; /* filled by st25r3916_probe() */
     uint8_t ic_rev;
+    const st25r_analog_config_t *analog; /* optional; NULL = chip reset defaults only */
 } st25r_t;
 
 /* Negative return codes for the RF flows below. */
@@ -88,6 +121,15 @@ void st25r3916_set_interrupt_mask(st25r_t *d, uint32_t mask);
 /* Read the IC identity register (0x3F) into d->ic_type / d->ic_rev. Returns true if the part
  * reads back as an ST25R3916B (ic_type == 0x06). */
 bool st25r3916_probe(st25r_t *d);
+
+/* ---- Analog configuration -------------------------------------------------------------- */
+/* Install the board's analog-config table (held by reference; NULL clears it). The RF flows
+ * below apply the entries for each event automatically; with no table they run on the chip's
+ * reset defaults. */
+void st25r3916_set_analog_config(st25r_t *d, const st25r_analog_config_t *cfg);
+/* Apply every table entry registered for `event`. Called by the RF flows; also exposed so a
+ * board can re-apply a set at its own points. No-op if no table is installed. */
+void st25r3916_apply_analog_config(st25r_t *d, st25r_analog_event_t event);
 
 /* ---- RF: power-up and ISO 14443-A (NFC-A) reader ---------------------------------------
  *

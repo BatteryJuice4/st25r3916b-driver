@@ -477,5 +477,43 @@ int main(void)
     st25r_wakeup_cfg_t bigp = {.measure_amplitude = true, .period = 8};
     CHECK_EQ(st25r3916_wakeup_start(&d, &bigp), ST25R_ERR_PARAM); /* period out of range */
 
+    /* ================= Analog configuration table ================= */
+    reset_chip();
+    static const st25r_analog_entry_t atbl[] = {
+        /* event, reg, mask, value, spaceb */
+        {ST25R_ANALOG_POWER_UP, ST25R_REG_ANT_TUNE1, 0xFF, 0x5A, 0},
+        {ST25R_ANALOG_POWER_UP, ST25R_REG_ANT_TUNE2, 0x0F, 0xFF, 0}, /* masked: low nibble only */
+        {ST25R_ANALOG_POLL_A, ST25R_REGB_CORR_CONF1, 0x0F, 0x03, 1}, /* space B */
+        {ST25R_ANALOG_LISTEN_A, ST25R_REG_TX_DRIVER, 0xFF, 0x11, 0},
+        {ST25R_ANALOG_WAKEUP, ST25R_REG_ANT_TUNE1, 0xFF, 0x77, 0},
+    };
+    st25r_analog_config_t acfg = {atbl, sizeof(atbl) / sizeof(atbl[0])};
+    st25r3916_set_analog_config(&d, &acfg);
+
+    /* ---- field_on applies POWER_UP and POLL_A, not LISTEN_A/WAKEUP ---- */
+    CHECK_EQ(st25r3916_field_on(&d), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_ANT_TUNE1], 0x5A);            /* POWER_UP, space A */
+    CHECK_EQ(g_rega[ST25R_REG_ANT_TUNE2], 0x0F);            /* POWER_UP, masked write */
+    CHECK_EQ(g_regb[ST25R_REGB_CORR_CONF1] & 0x0F, 0x03);  /* POLL_A, space B */
+    CHECK_EQ(g_rega[ST25R_REG_TX_DRIVER], 0x00);           /* LISTEN_A not applied here */
+
+    /* ---- listen_start applies POWER_UP and LISTEN_A ---- */
+    reset_chip();
+    st25r3916_set_analog_config(&d, &acfg);
+    st25r_nfca_target_t lt = {.nfcid1 = {1, 2, 3, 4}, .nfcid1_len = 4, .atqa = {0x44, 0}, .sak = 0};
+    CHECK_EQ(st25r3916_listen_start(&d, &lt), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_ANT_TUNE1], 0x5A); /* POWER_UP */
+    CHECK_EQ(g_rega[ST25R_REG_TX_DRIVER], 0x11); /* LISTEN_A */
+
+    /* ---- apply by hand; and WAKEUP targets ANT_TUNE1 differently ---- */
+    st25r3916_apply_analog_config(&d, ST25R_ANALOG_WAKEUP);
+    CHECK_EQ(g_rega[ST25R_REG_ANT_TUNE1], 0x77);
+
+    /* ---- clearing the table makes apply a no-op (reset defaults) ---- */
+    reset_chip();
+    st25r3916_set_analog_config(&d, NULL);
+    st25r3916_apply_analog_config(&d, ST25R_ANALOG_POWER_UP);
+    CHECK_EQ(g_rega[ST25R_REG_ANT_TUNE1], 0x00);
+
     TEST_MAIN_END();
 }

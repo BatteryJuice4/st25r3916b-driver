@@ -45,12 +45,18 @@ microcontroller.
   the antenna amplitude and/or phase, raising an interrupt when a tag detunes the antenna past
   a threshold. Supports a fixed calibrated reference or a drift-tracking auto-average. The
   delta thresholds are antenna-specific and must be tuned on hardware.
+- **Analog-config table** (`st25r3916_set_analog_config` / `apply_analog_config`): the
+  receiver/modulation/regulator settings depend on your antenna, so you supply them as a table
+  of `{event, register, mask, value, space}` tweaks and the RF flows apply the right ones at
+  each event (power-up, NFC-A poll, NFC-A listen, wake-up). See
+  `examples/analog_config_example.c`.
 
 **Not implemented yet** (contributions welcome — these need the datasheet's analog/RF
 sections and, to be trusted, a real chip):
 
-- The **analog-config register values** (receiver, modulation, regulators) — those depend on
-  your antenna and matching network, so the RF calls leave the reset defaults in place.
+- Ready-made **analog values for a specific antenna** — the table mechanism is here, but the
+  numbers are yours to supply and tune (the driver runs on the chip's reset defaults without
+  a table).
 - **Multi-card collision resolution** (the current anticollision reads a single card and
   reports `ST25R_ERR_COLLISION` when more than one answers).
 - Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz, as reader or
@@ -107,6 +113,7 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_nfca_request` / `nfca_select` | REQA/WUPA and the ISO 14443-A UID cascade |
 | `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_stop` | NFC-A card emulation |
 | `st25r3916_wakeup_start` / `wakeup_cause` / `wakeup_stop` | Low-power tag detection (wake-up mode) |
+| `st25r3916_set_analog_config` / `apply_analog_config` | Install/apply the antenna's analog settings |
 
 The RF calls expect the chip's IRQ pin wired to an optional `st25r_bus_t.wait_irq` callback
 (they poll the interrupt registers if it is `NULL`). They return `ST25R_OK` or a negative
