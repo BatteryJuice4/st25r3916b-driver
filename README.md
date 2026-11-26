@@ -31,10 +31,14 @@ microcontroller.
 - **Interrupt-driven transceive** (`st25r3916_transceive`): TX from the FIFO with the
   number-of-transmitted-bytes registers, RX back out of it, CRC / parity / bit-oriented
   anticollision framing flags, and error/collision/CRC reporting.
-- **NFC-A activation** (`st25r3916_nfca_request`, `st25r3916_nfca_select`): REQA/WUPA and the
-  full ISO 14443-A anticollision + SELECT cascade (levels 1–3) for a single card, returning
-  the UID (4/7/10 bytes), ATQA and SAK. The unit test drives it against a fake card that
-  answers both 4- and 7-byte-UID cascades.
+- **NFC-A activation** (`st25r3916_nfca_request`, `st25r3916_nfca_select`,
+  `st25r3916_nfca_halt`): REQA/WUPA and the full ISO 14443-A anticollision + SELECT cascade
+  (levels 1–3), returning the UID (4/7/10 bytes), ATQA and SAK. **Several cards in the field**
+  are resolved bit by bit (ISO 14443-3 §6.5.3: keep the bits before the collision from the
+  Collision display register, choose 1, ask again with the longer prefix); `collided` says
+  others answered, and HLTA + select again finds each in turn. The unit test drives it
+  against fake cards with 4- and 7-byte UIDs, including collisions on the first and last UID
+  bit and two 7-byte cards that only differ at cascade level 2.
 - **NFC-A card emulation** (`st25r3916_listen_start` / `listen_poll` / `listen_respond` /
   `listen_stop`): act as a tag. The chip answers REQA, anticollision and SELECT automatically
   from PT_Memory (loaded with the NFCID1/ATQA/SAK, 4- or 7-byte UID); the host is notified
@@ -57,8 +61,6 @@ sections and, to be trusted, a real chip):
 - Ready-made **analog values for a specific antenna** — the table mechanism is here, but the
   numbers are yours to supply and tune (the driver runs on the chip's reset defaults without
   a table).
-- **Multi-card collision resolution** (the current anticollision reads a single card and
-  reports `ST25R_ERR_COLLISION` when more than one answers).
 - Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz, as reader or
   as a target.
 
@@ -110,7 +112,7 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_cmd` | Any direct command (`ST25R_CMD_*`) |
 | `st25r3916_field_on` / `field_off` | Power up to Ready and switch the RF field on/off |
 | `st25r3916_transceive` | Send/receive a frame (CRC, parity, anticollision flags) |
-| `st25r3916_nfca_request` / `nfca_select` | REQA/WUPA and the ISO 14443-A UID cascade |
+| `st25r3916_nfca_request` / `nfca_select` / `nfca_halt` | REQA/WUPA, the ISO 14443-A UID cascade with collision resolution, HLTA |
 | `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_stop` | NFC-A card emulation |
 | `st25r3916_wakeup_start` / `wakeup_cause` / `wakeup_stop` | Low-power tag detection (wake-up mode) |
 | `st25r3916_set_analog_config` / `apply_analog_config` | Install/apply the antenna's analog settings |
@@ -118,6 +120,11 @@ for a complete fake bus that emulates the register file.
 The RF calls expect the chip's IRQ pin wired to an optional `st25r_bus_t.wait_irq` callback
 (they poll the interrupt registers if it is `NULL`). They return `ST25R_OK` or a negative
 `ST25R_ERR_*`.
+
+Two details of the split-byte anticollision frame are not spelled out in DS13541 and are
+assumptions to confirm on a real chip: the first received byte is aligned to the split
+position, and the Collision display register (0x20) counts from the start of the frame
+(SEL). If either is wrong, `nfca_select` returns `ST25R_ERR_FRAMING` rather than a wrong UID.
 
 No dynamic allocation. The calls are safe to use from an ISR if your bus callback is.
 

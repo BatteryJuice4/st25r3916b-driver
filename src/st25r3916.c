@@ -361,6 +361,101 @@ int st25r3916_nfca_request(st25r_t *d, uint8_t atqa[2], bool wupa)
     return ST25R_OK;
 }
 
+/* One ISO 14443-3 anticollision round. `frame` is SEL, NVB and the 5 bytes CLn (4 UID bytes
+ * + BCC) of this cascade level, of which the first `known` bits (0..39) are valid. Sends SEL,
+ * NVB and those bits as a bit-oriented frame, merges the card(s)' answer into frame[2..6] and
+ * returns the number of valid bits after it: 40 for a clean answer, or the position of the
+ * first collided bit (that bit and the ones after it are left 0). Negative ST25R_ERR_* on
+ * failure.
+ *
+ * Two points DS13541 does not spell out, to verify on hardware: (1) the first received byte
+ * is assumed to be aligned to the split position, i.e. the card's first bit lands at bit
+ * `nbtx` of FIFO byte 0 (as ISO 14443-3 Figure "split byte" draws it); (2) c_byte/c_bit in
+ * the Collision display register are assumed to count from the start of the frame (SEL),
+ * since Table 68 says the register "covers the ISO14443A anticollision command". Either
+ * being wrong shows up as ST25R_ERR_FRAMING from the position check below, not a wrong UID
+ * (the BCC check and SELECT catch the rest). */
+static int anticol_round(st25r_t *d, uint8_t frame[7], int known)
+{
+    if (known < 0 || known >= 40) {
+        return ST25R_ERR_PARAM;
+    }
+    int tx_bits = 16 + known;
+    int nbytes = tx_bits / 8;
+    int nbits = tx_bits % 8;
+    frame[1] = (uint8_t)((nbytes << 4) | nbits); /* NVB: bytes (incl. SEL/NVB), then bits */
+    uint8_t keep = (uint8_t)((1u << nbits) - 1u); /* valid low bits of the split byte */
+    if (nbits) {
+        frame[nbytes] &= keep;
+    }
+    for (int i = nbytes + (nbits ? 1 : 0); i < 7; i++) {
+        frame[i] = 0;
+    }
+
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    st25r3916_cmd(d, ST25R_CMD_RESET_RXGAIN);
+    st25r3916_modify_reg(d, ST25R_REG_ISO14443A_NFC,
+                         ST25R_A_ANTCL | ST25R_A_NO_TX_PAR | ST25R_A_NO_RX_PAR, ST25R_A_ANTCL);
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, ST25R_NTX1(nbytes));
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, ST25R_NTX2(nbytes, nbits));
+    st25r3916_write_fifo(d, frame, (size_t)(nbytes + (nbits ? 1 : 0)));
+
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, ST25R_CMD_TRANSMIT_WITHOUT_CRC);
+    if (!(wait_irqs(d, IRQ_M(ST25R_IRQ_TXE), 20) & IRQ_M(ST25R_IRQ_TXE))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+    uint32_t end = IRQ_M(ST25R_IRQ_RXE) | IRQ_T(ST25R_IRQ_NRE);
+    uint32_t irq = wait_irqs(d, end | IRQ_M(ST25R_IRQ_COL) | IRQ_E(ST25R_IRQ_ERR1), 20);
+    if ((irq & IRQ_M(ST25R_IRQ_COL)) && !(irq & end)) {
+        irq |= wait_irqs(d, end, 20); /* collision seen; let the reception finish */
+    }
+    if (irq & IRQ_E(ST25R_IRQ_ERR1)) {
+        return ST25R_ERR_FRAMING; /* the collision register is not valid after I_err1 */
+    }
+    if (!(irq & (IRQ_M(ST25R_IRQ_RXE) | IRQ_M(ST25R_IRQ_COL)))) {
+        return ST25R_ERR_TIMEOUT; /* no card answered */
+    }
+
+    uint8_t fs[2];
+    st25r3916_read_regs(d, ST25R_REG_FIFO_STATUS1, fs, 2);
+    int count = fs[0] | ((fs[1] >> ST25R_FIFO2_B9_B8_SHIFT) << 8);
+    uint8_t rx[8] = {0};
+    int room = 7 - nbytes; /* frame bytes still to fill, the split byte included */
+    if (count > (int)sizeof(rx)) {
+        return ST25R_ERR_FRAMING;
+    }
+    if (count > 0) {
+        st25r3916_read_fifo(d, rx, (size_t)count);
+    }
+    for (int i = 0; i < count && i < room; i++) {
+        if (i == 0 && nbits) {
+            frame[nbytes] = (uint8_t)((frame[nbytes] & keep) | (rx[0] & (uint8_t)~keep));
+        } else {
+            frame[nbytes + i] = rx[i];
+        }
+    }
+
+    if (!(irq & IRQ_M(ST25R_IRQ_COL))) {
+        return count >= room ? 40 : ST25R_ERR_FRAMING;
+    }
+    uint8_t coll = st25r3916_read_reg(d, ST25R_REG_COLLISION);
+    if (coll & ST25R_COLL_PB) {
+        return ST25R_ERR_FRAMING; /* equal data bits but differing parity: noise, not cards */
+    }
+    int pos = (int)((coll & ST25R_COLL_BYTE_MASK) >> ST25R_COLL_BYTE_SHIFT) * 8 +
+              (int)((coll & ST25R_COLL_BIT_MASK) >> ST25R_COLL_BIT_SHIFT) - 16;
+    if (pos < known || pos >= 40) {
+        return ST25R_ERR_FRAMING;
+    }
+    /* Keep the bits before the collision; clear it and everything after it. */
+    frame[2 + pos / 8] &= (uint8_t)((1u << (pos % 8)) - 1u);
+    for (int i = 2 + pos / 8 + 1; i < 7; i++) {
+        frame[i] = 0;
+    }
+    return pos;
+}
+
 int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
 {
     static const uint8_t SEL[3] = {0x93, 0x95, 0x97}; /* cascade levels 1..3 */
@@ -372,27 +467,35 @@ int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
     }
 
     for (int lvl = 0; lvl < 3; lvl++) {
-        /* ANTICOLLISION: SEL + NVB=0x20 (no UID bits known), bit-oriented, no CRC.
-         * A single card answers with its 4 UID bytes of this level plus the BCC. */
-        uint8_t ac[2] = {SEL[lvl], 0x20};
-        uint8_t resp[8];
-        rc = st25r3916_transceive(d, ac, 16, ST25R_TX_ANTICOL, resp, sizeof(resp), NULL, 20);
-        if (rc == ST25R_ERR_COLLISION) {
-            return ST25R_ERR_COLLISION; /* more than one card; not resolved here */
+        /* ANTICOLLISION (ISO 14443-3 §6.5.3): start with no UID bits known (NVB=0x20). On a
+         * collision keep the bits before it, choose 1 for the collided bit and ask again
+         * with the longer prefix; only the cards that match it answer. Each round learns at
+         * least one bit, so 40 rounds always finish a level. */
+        uint8_t resp[7] = {SEL[lvl], 0x20};
+        int known = 0;
+        for (int round = 0; known < 40; round++) {
+            if (round >= 40) {
+                return ST25R_ERR_FRAMING;
+            }
+            rc = anticol_round(d, resp, known);
+            if (rc < 0) {
+                return rc;
+            }
+            if (rc < 40) {
+                resp[2 + rc / 8] |= (uint8_t)(1u << (rc % 8));
+                out->collided = true;
+                rc++;
+            }
+            known = rc;
         }
-        if (rc < 0) {
-            return rc;
-        }
-        if (rc < 5) {
-            return ST25R_ERR_FRAMING;
-        }
-        uint8_t bcc = (uint8_t)(resp[0] ^ resp[1] ^ resp[2] ^ resp[3]);
-        if (bcc != resp[4]) {
+        uint8_t *cln = resp + 2;
+        uint8_t bcc = (uint8_t)(cln[0] ^ cln[1] ^ cln[2] ^ cln[3]);
+        if (bcc != cln[4]) {
             return ST25R_ERR_FRAMING;
         }
 
         /* SELECT: SEL + NVB=0x70 + the 4 UID bytes + BCC, with CRC. The card returns SAK. */
-        uint8_t sel[7] = {SEL[lvl], 0x70, resp[0], resp[1], resp[2], resp[3], resp[4]};
+        uint8_t sel[7] = {SEL[lvl], 0x70, cln[0], cln[1], cln[2], cln[3], cln[4]};
         uint8_t sak[4];
         rc = st25r3916_transceive(d, sel, 56, ST25R_TX_CRC, sak, sizeof(sak), NULL, 20);
         if (rc < 1) {
@@ -402,18 +505,18 @@ int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
 
         /* Accumulate the UID. A level that carries the cascade tag (CT=0x88) contributes its
          * last three bytes; a final level contributes all four. */
-        if (resp[0] == 0x88) {
+        if (cln[0] == 0x88) {
             if (out->uid_len + 3 <= (int)sizeof(out->uid)) {
-                out->uid[out->uid_len++] = resp[1];
-                out->uid[out->uid_len++] = resp[2];
-                out->uid[out->uid_len++] = resp[3];
+                out->uid[out->uid_len++] = cln[1];
+                out->uid[out->uid_len++] = cln[2];
+                out->uid[out->uid_len++] = cln[3];
             }
         } else {
             if (out->uid_len + 4 <= (int)sizeof(out->uid)) {
-                out->uid[out->uid_len++] = resp[0];
-                out->uid[out->uid_len++] = resp[1];
-                out->uid[out->uid_len++] = resp[2];
-                out->uid[out->uid_len++] = resp[3];
+                out->uid[out->uid_len++] = cln[0];
+                out->uid[out->uid_len++] = cln[1];
+                out->uid[out->uid_len++] = cln[2];
+                out->uid[out->uid_len++] = cln[3];
             }
         }
 
@@ -422,6 +525,19 @@ int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
         }
     }
     return ST25R_ERR_FRAMING; /* ran out of cascade levels without completing */
+}
+
+int st25r3916_nfca_halt(st25r_t *d)
+{
+    /* HLTA: 50 00 + CRC. The card does not answer; any answer within the 1 ms window means
+     * it was not acknowledged (ISO 14443-3 §6.4.3). */
+    static const uint8_t hlta[2] = {0x50, 0x00};
+    uint8_t rx[4];
+    int rc = st25r3916_transceive(d, hlta, 16, ST25R_TX_CRC, rx, sizeof(rx), NULL, 2);
+    if (rc == ST25R_ERR_TIMEOUT) {
+        return ST25R_OK;
+    }
+    return rc < 0 ? rc : ST25R_ERR_FRAMING;
 }
 
 /* ===== RF: ISO 14443-A card emulation (listen / target mode, DS13541 §4.2.14) ==========

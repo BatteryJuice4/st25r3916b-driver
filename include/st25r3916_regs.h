@@ -291,6 +291,14 @@ enum {
 #define ST25R_FIFO2_NP_LB (1u << 0) /* parity bit missing in the last byte */
 #define ST25R_FIFO_DEPTH 512
 
+/* ---- Collision display register (0x20, DS13541 Table 68) ------------------------------- *
+ * Valid after a bit collision in an ISO 14443-A anticollision frame (not if I_err1 is set). */
+#define ST25R_COLL_BYTE_SHIFT 4 /* c_byte<3:0>: full bytes before the collision */
+#define ST25R_COLL_BYTE_MASK (0xFu << 4)
+#define ST25R_COLL_BIT_SHIFT 1 /* c_bit<2:0>: bits before the collision in that byte */
+#define ST25R_COLL_BIT_MASK (0x7u << 1)
+#define ST25R_COLL_PB (1u << 0) /* c_pb: the first collision was in a parity bit */
+
 /* ---- IC identity register (0x3F, DS13541 Table 121) ------------------------------------ */
 #define ST25R_IC_TYPE_SHIFT 3
 #define ST25R_IC_TYPE_MASK (0x1Fu << 3)

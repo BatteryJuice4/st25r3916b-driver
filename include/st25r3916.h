@@ -80,7 +80,7 @@ enum {
     ST25R_OK = 0,
     ST25R_ERR_NODEV = -1,     /* probe failed: no ST25R3916B on the bus */
     ST25R_ERR_TIMEOUT = -2,   /* expected interrupt / response did not arrive */
-    ST25R_ERR_COLLISION = -3, /* bit collision (more than one card, not resolved here) */
+    ST25R_ERR_COLLISION = -3, /* bit collision in a frame, or another reader's field */
     ST25R_ERR_CRC = -4,       /* CRC or parity error in the response */
     ST25R_ERR_FRAMING = -5,   /* framing error / malformed response */
     ST25R_ERR_NOMEM = -6,     /* caller's buffer too small */
@@ -168,6 +168,7 @@ typedef struct {
     uint8_t uid[10];  /* 4, 7 or 10 bytes */
     uint8_t uid_len;
     uint8_t sak;      /* select acknowledge (SAK) of the last cascade level */
+    bool collided;    /* other cards answered too: HLTA this one, then select again */
 } st25r_nfca_t;
 
 /* ISO 14443-A REQA (0x26) short frame; returns the 2-byte ATQA or ST25R_ERR_TIMEOUT if no
@@ -175,10 +176,16 @@ typedef struct {
 int st25r3916_nfca_request(st25r_t *d, uint8_t atqa[2], bool wupa);
 
 /* Full ISO 14443-A activation: REQA, then the anticollision + SELECT cascade (levels 1..3)
- * to read the UID and SAK of a single card in the field into `out`. Returns ST25R_OK, or
- * ST25R_ERR_COLLISION if more than one card is present (this driver does not yet resolve
- * collisions), or another negative ST25R_ERR_*. */
+ * into `out` (UID, ATQA, SAK). With several cards in the field the bit collisions are
+ * resolved (ISO 14443-3 §6.5.3, choosing 1 at each collided bit), so exactly one card ends
+ * up selected and `out->collided` is set. To find the others, HLTA the selected card with
+ * st25r3916_nfca_halt() and call this again; ST25R_ERR_TIMEOUT means none are left. Halted
+ * cards stay quiet until the field drops or a WUPA. Returns ST25R_OK or a negative
+ * ST25R_ERR_*. */
 int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out);
+
+/* Send HLTA to the selected card (it goes to HALT and ignores REQA). Returns ST25R_OK. */
+int st25r3916_nfca_halt(st25r_t *d);
 
 /* ---- RF: ISO 14443-A card emulation (listen / target mode) -----------------------------
  *

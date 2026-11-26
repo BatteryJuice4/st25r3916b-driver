@@ -25,12 +25,37 @@ static uint8_t g_last_tx[520];
 static size_t g_last_n;
 static uint8_t g_last_cmd;
 
-/* The emulated card. */
-static uint8_t g_uid[10];
-static int g_uidlen;
-static uint8_t g_atqa[2];
-static uint8_t g_sak_final;
-static bool g_card_present;
+/* The emulated cards. Card 0 is the one most tests use (the g_uid.. names below); others
+ * join it in the field for the multi-card anticollision tests. States per ISO 14443-3. */
+enum { CARD_IDLE = 0, CARD_READY, CARD_ACTIVE, CARD_HALT };
+typedef struct {
+    bool present;
+    uint8_t uid[10];
+    int uidlen;
+    uint8_t atqa[2];
+    uint8_t sak_final;
+    int state;
+    int lvl; /* cascade level the card is at while READY */
+} fake_card_t;
+#define NCARDS 3
+static fake_card_t g_cards[NCARDS];
+#define g_uid (g_cards[0].uid)
+#define g_uidlen (g_cards[0].uidlen)
+#define g_atqa (g_cards[0].atqa)
+#define g_sak_final (g_cards[0].sak_final)
+#define g_card_present (g_cards[0].present)
+
+static bool g_bad_coll; /* report a nonsense collision position */
+
+static void add_card(int k, const uint8_t *uid, int len, uint8_t sak)
+{
+    g_cards[k].present = true;
+    memcpy(g_cards[k].uid, uid, len);
+    g_cards[k].uidlen = len;
+    g_cards[k].atqa[0] = len == 4 ? 0x04 : 0x44;
+    g_cards[k].sak_final = sak;
+    g_cards[k].state = CARD_IDLE;
+}
 
 /* Listen (card-emulation) mode: PT_Memory the host loaded into us. */
 static uint8_t g_pt[16];
@@ -43,40 +68,36 @@ static uint8_t g_sim_phase = 0x33;
 #define FI_M(bit) ((uint32_t)(bit))
 #define FI_T(bit) ((uint32_t)(bit) << 8)
 
-/* Build cascade level `lvl`'s 4 anticollision bytes (CLn) for the card's UID. */
-static int card_cln(int lvl, uint8_t out[4])
+/* Build cascade level `lvl`'s 5 anticollision bytes (CLn + BCC) for a card's UID. */
+static int card_cln(const fake_card_t *c, int lvl, uint8_t out[5])
 {
-    if (g_uidlen == 4) {
-        if (lvl != 0) {
-            return 0;
-        }
-        memcpy(out, g_uid, 4);
-        return 1;
+    if (c->uidlen == 4 && lvl == 0) {
+        memcpy(out, c->uid, 4);
+    } else if (c->uidlen == 7 && lvl == 0) {
+        out[0] = 0x88; /* cascade tag */
+        memcpy(out + 1, c->uid, 3);
+    } else if (c->uidlen == 7 && lvl == 1) {
+        memcpy(out, c->uid + 3, 4);
+    } else {
+        return 0;
     }
-    if (g_uidlen == 7) {
-        if (lvl == 0) {
-            out[0] = 0x88; /* cascade tag */
-            out[1] = g_uid[0];
-            out[2] = g_uid[1];
-            out[3] = g_uid[2];
-            return 1;
-        }
-        if (lvl == 1) {
-            memcpy(out, g_uid + 3, 4);
-            return 1;
-        }
-    }
-    return 0;
+    out[4] = (uint8_t)(out[0] ^ out[1] ^ out[2] ^ out[3]);
+    return 1;
 }
 
-static bool card_level_is_final(int lvl)
+static bool card_level_is_final(const fake_card_t *c, int lvl)
 {
-    return (g_uidlen == 4) || (g_uidlen == 7 && lvl == 1);
+    return (c->uidlen == 4) || (c->uidlen == 7 && lvl == 1);
+}
+
+static int bit_of(const uint8_t *b, int i)
+{
+    return (b[i / 8] >> (i % 8)) & 1;
 }
 
 static void card_transmit(void)
 {
-    /* The host loaded a SEL frame into g_txbuf: [SEL, NVB, ...]. */
+    /* The host loaded a frame into g_txbuf: [SEL, NVB, ...] or HLTA [50 00]. */
     static const uint8_t SEL[3] = {0x93, 0x95, 0x97};
     int lvl = -1;
     for (int i = 0; i < 3; i++) {
@@ -85,26 +106,112 @@ static void card_transmit(void)
         }
     }
     g_fifo_len = 0;
-    if (g_card_present && lvl >= 0 && g_txlen >= 2) {
+    bool collision = false;
+
+    if (g_txlen >= 2 && g_txbuf[0] == 0x50 && g_txbuf[1] == 0x00) { /* HLTA: no answer */
+        for (int k = 0; k < NCARDS; k++) {
+            if (g_cards[k].present && g_cards[k].state == CARD_ACTIVE) {
+                g_cards[k].state = CARD_HALT;
+            }
+        }
+    } else if (lvl >= 0 && g_txlen >= 2 && g_txbuf[1] == 0x70) { /* SELECT: SAK + CRC */
+        for (int k = 0; k < NCARDS; k++) {
+            fake_card_t *c = &g_cards[k];
+            uint8_t cln[5];
+            if (!c->present || c->state != CARD_READY || c->lvl != lvl || !card_cln(c, lvl, cln)) {
+                continue;
+            }
+            if (g_txlen >= 7 && !memcmp(cln, g_txbuf + 2, 5)) {
+                bool fin = card_level_is_final(c, lvl);
+                g_fifo[0] = fin ? c->sak_final : 0x04; /* 0x04 = cascade bit */
+                g_fifo[1] = 0x00;
+                g_fifo[2] = 0x00; /* fake CRC; the chip checks it, the driver does not */
+                g_fifo_len = 3;
+                if (fin) {
+                    c->state = CARD_ACTIVE;
+                } else {
+                    c->lvl++;
+                }
+            } else {
+                c->state = CARD_IDLE; /* another card was selected */
+            }
+        }
+    } else if (lvl >= 0 && g_txlen >= 2) { /* ANTICOLLISION with `known` UID bits */
         uint8_t nvb = g_txbuf[1];
-        uint8_t cln[4];
-        if (!card_cln(lvl, cln)) {
-            /* no such level for this card: no answer */
-        } else if (nvb == 0x20) { /* ANTICOLLISION: UID bytes + BCC */
-            memcpy(g_fifo, cln, 4);
-            g_fifo[4] = (uint8_t)(cln[0] ^ cln[1] ^ cln[2] ^ cln[3]);
-            g_fifo_len = 5;
-        } else if (nvb == 0x70) { /* SELECT: SAK (+ 2 CRC bytes) */
-            g_fifo[0] = card_level_is_final(lvl) ? g_sak_final : 0x04; /* 0x04 = cascade bit */
-            g_fifo[1] = 0x00;
-            g_fifo[2] = 0x00; /* fake CRC; the chip checks it, the driver does not */
-            g_fifo_len = 3;
+        int nbytes = nvb >> 4, nbits = nvb & 7;
+        int known = (nbytes - 2) * 8 + nbits;
+        uint8_t img[7] = {0}; /* the frame image as the reader hears it (answers ORed) */
+        uint8_t first[5];
+        int n = 0, coll = 40;
+        for (int k = 0; k < NCARDS; k++) {
+            fake_card_t *c = &g_cards[k];
+            uint8_t cln[5];
+            if (!c->present || c->state != CARD_READY || c->lvl != lvl || !card_cln(c, lvl, cln)) {
+                continue;
+            }
+            bool match = known >= 0 && known < 40;
+            for (int i = 0; match && i < known; i++) {
+                match = bit_of(cln, i) == bit_of(g_txbuf + 2, i);
+            }
+            if (!match) {
+                continue;
+            }
+            if (n++ == 0) {
+                memcpy(first, cln, 5);
+            } else {
+                for (int i = known; i < 40; i++) {
+                    if (bit_of(cln, i) != bit_of(first, i)) {
+                        if (i < coll) {
+                            coll = i;
+                        }
+                        break;
+                    }
+                }
+            }
+            for (int i = 0; i < 5; i++) {
+                img[2 + i] |= cln[i];
+            }
+        }
+        if (n > 0) {
+            /* The answer starts at the split position, aligned within the first byte. */
+            g_fifo_len = 7 - nbytes;
+            memcpy(g_fifo, img + nbytes, g_fifo_len);
+            g_fifo[0] &= (uint8_t)~((1u << nbits) - 1u);
+            if (n > 1 && coll < 40) {
+                collision = true;
+                int pos = g_bad_coll ? 0 : 16 + coll;
+                g_rega[ST25R_REG_COLLISION] =
+                    (uint8_t)(((pos / 8) << ST25R_COLL_BYTE_SHIFT) | ((pos % 8) << ST25R_COLL_BIT_SHIFT));
+            }
         }
     }
     /* Transmit finishes first (I_txe); the reply (I_rxe) or the no-response timeout (I_nre)
      * arrives as a separate, later interrupt. */
     g_irq |= FI_M(ST25R_IRQ_TXE);
     g_deferred |= (g_fifo_len > 0) ? FI_M(ST25R_IRQ_RXE) : FI_T(ST25R_IRQ_NRE);
+    if (collision) {
+        g_deferred |= FI_M(ST25R_IRQ_COL);
+    }
+}
+
+/* REQA wakes IDLE cards (this fake is lenient: any card not halted), WUPA wakes halted ones
+ * too. All woken cards answer at once; their ATQAs OR together on the air. */
+static int cards_request(bool wupa)
+{
+    int n = 0;
+    g_fifo[0] = g_fifo[1] = 0;
+    for (int k = 0; k < NCARDS; k++) {
+        fake_card_t *c = &g_cards[k];
+        if (!c->present || (c->state == CARD_HALT && !wupa)) {
+            continue;
+        }
+        c->state = CARD_READY;
+        c->lvl = 0;
+        g_fifo[0] |= c->atqa[0];
+        g_fifo[1] |= c->atqa[1];
+        n++;
+    }
+    return n;
 }
 
 static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
@@ -214,8 +321,7 @@ static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
         case ST25R_CMD_TRANSMIT_REQA:
         case ST25R_CMD_TRANSMIT_WUPA:
             g_irq |= FI_M(ST25R_IRQ_TXE);
-            if (g_card_present) {
-                memcpy(g_fifo, g_atqa, 2);
+            if (cards_request(op == ST25R_CMD_TRANSMIT_WUPA) > 0) {
                 g_fifo_len = 2;
                 g_deferred |= FI_M(ST25R_IRQ_RXE);
             } else {
@@ -364,10 +470,90 @@ int main(void)
     g_card_present = true;
     g_uidlen = 4;
     memcpy(g_uid, (uint8_t[]){0x01, 0x02, 0x03, 0x04}, 4);
+    uint8_t atqa[2];
+    CHECK_EQ(st25r3916_nfca_request(&d, atqa, false), ST25R_OK); /* card to READY */
     uint8_t sel[2] = {0x93, 0x20};
     uint8_t tiny[2];
     CHECK_EQ(st25r3916_transceive(&d, sel, 16, ST25R_TX_ANTICOL, tiny, sizeof(tiny), NULL, 20),
              ST25R_ERR_NOMEM); /* the 5-byte answer does not fit 2 bytes */
+
+    /* ================= Several cards: anticollision resolution ================= */
+
+    /* ---- two 4-byte cards differing in one bit: the 1-branch wins, HLTA finds the other ---- */
+    reset_chip();
+    memset(g_cards, 0, sizeof(g_cards));
+    add_card(0, (uint8_t[]){0x04, 0x11, 0x22, 0x33}, 4, 0x08);
+    add_card(1, (uint8_t[]){0x04, 0x11, 0x2A, 0x33}, 4, 0x08); /* byte 2, bit 3 differs */
+    CHECK_EQ(st25r3916_nfca_select(&d, &card), ST25R_OK);
+    CHECK(card.collided);
+    CHECK_EQ(card.uid_len, 4);
+    CHECK(!memcmp(card.uid, g_cards[1].uid, 4)); /* the collided bit was chosen as 1 */
+    CHECK_EQ(g_cards[1].state, CARD_ACTIVE);
+    CHECK_EQ(g_cards[0].state, CARD_IDLE); /* dropped out at the SELECT */
+    CHECK_EQ(st25r3916_nfca_halt(&d), ST25R_OK);
+    CHECK_EQ(g_cards[1].state, CARD_HALT);
+    CHECK_EQ(st25r3916_nfca_select(&d, &card), ST25R_OK);
+    CHECK(!card.collided);
+    CHECK(!memcmp(card.uid, g_cards[0].uid, 4));
+    CHECK_EQ(st25r3916_nfca_halt(&d), ST25R_OK);
+    CHECK_EQ(st25r3916_nfca_select(&d, &card), ST25R_ERR_TIMEOUT); /* all halted */
+    uint8_t wq[2];
+    CHECK_EQ(st25r3916_nfca_request(&d, wq, true), ST25R_OK); /* WUPA wakes halted cards */
+
+    /* ---- collisions on the very first and the very last UID bit ---- */
+    reset_chip();
+    memset(g_cards, 0, sizeof(g_cards));
+    add_card(0, (uint8_t[]){0x10, 0x20, 0x30, 0x40}, 4, 0x08);
+    add_card(1, (uint8_t[]){0x11, 0x20, 0x30, 0x40}, 4, 0x08); /* bit 0 */
+    add_card(2, (uint8_t[]){0x11, 0x20, 0x30, 0xC0}, 4, 0x08); /* and bit 31 */
+    int seen = 0;
+    for (int i = 0; i < 4; i++) {
+        int rc = st25r3916_nfca_select(&d, &card);
+        if (rc == ST25R_ERR_TIMEOUT) {
+            break;
+        }
+        CHECK_EQ(rc, ST25R_OK);
+        for (int k = 0; k < 3; k++) {
+            if (!memcmp(card.uid, g_cards[k].uid, 4)) {
+                seen |= 1 << k;
+            }
+        }
+        CHECK_EQ(st25r3916_nfca_halt(&d), ST25R_OK);
+    }
+    CHECK_EQ(seen, 7);
+
+    /* ---- two 7-byte cards sharing cascade level 1 plus a 4-byte card: all three found ---- */
+    reset_chip();
+    memset(g_cards, 0, sizeof(g_cards));
+    add_card(0, (uint8_t[]){0x04, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}, 7, 0x00);
+    add_card(1, (uint8_t[]){0x04, 0xAA, 0xBB, 0x01, 0xDD, 0xEE, 0xFF}, 7, 0x00); /* level 2 */
+    add_card(2, (uint8_t[]){0x80, 0x01, 0x02, 0x03}, 4, 0x20);
+    seen = 0;
+    for (int i = 0; i < 5; i++) {
+        int rc = st25r3916_nfca_select(&d, &card);
+        if (rc == ST25R_ERR_TIMEOUT) {
+            break;
+        }
+        CHECK_EQ(rc, ST25R_OK);
+        for (int k = 0; k < 3; k++) {
+            if (card.uid_len == g_cards[k].uidlen && !memcmp(card.uid, g_cards[k].uid, card.uid_len)) {
+                seen |= 1 << k;
+                CHECK_EQ(card.sak, g_cards[k].sak_final);
+            }
+        }
+        CHECK_EQ(st25r3916_nfca_halt(&d), ST25R_OK);
+    }
+    CHECK_EQ(seen, 7);
+
+    /* ---- an impossible collision position (before the known bits) is a framing error ---- */
+    reset_chip();
+    memset(g_cards, 0, sizeof(g_cards));
+    add_card(0, (uint8_t[]){0x04, 0x11, 0x22, 0x33}, 4, 0x08);
+    add_card(1, (uint8_t[]){0x04, 0x11, 0x2A, 0x33}, 4, 0x08);
+    g_bad_coll = true; /* the fake reports byte 0 bit 0 (inside SEL) */
+    CHECK_EQ(st25r3916_nfca_select(&d, &card), ST25R_ERR_FRAMING);
+    g_bad_coll = false;
+    memset(g_cards, 0, sizeof(g_cards));
 
     /* ================= Listen mode (card emulation) ================= */
     reset_chip();
