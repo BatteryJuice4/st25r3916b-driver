@@ -127,7 +127,7 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_nfcf_poll` | FeliCa polling |
 | `st25r3916_nfcv_inventory` / `nfcv_transceive` | ISO 15693 reader (driver-coded stream mode) |
 | `st25r3916_nfca_request` / `nfca_select` / `nfca_halt` | REQA/WUPA, the ISO 14443-A UID cascade with collision resolution, HLTA |
-| `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_stop` | NFC-A card emulation |
+| `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_respond_bits` / `listen_stop` | NFC-A card emulation (`_bits`: short frames such as the 4-bit ACK) |
 | `st25r3916_wakeup_start` / `wakeup_cause` / `wakeup_stop` | Low-power tag detection (wake-up mode) |
 | `st25r3916_set_analog_config` / `apply_analog_config` | Install/apply the antenna's analog settings |
 

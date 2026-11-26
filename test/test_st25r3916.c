@@ -17,6 +17,7 @@ static uint8_t g_rega[64];
 static uint8_t g_regb[64];
 static uint8_t g_fifo[512]; /* current FIFO contents (what a read returns) */
 static int g_fifo_len;
+static int g_fifo_lb; /* bits in the last FIFO byte if partial */
 static uint8_t g_txbuf[512]; /* the last frame the host loaded, for the card to interpret */
 static int g_txlen;
 static uint32_t g_irq;      /* pending interrupts, packed like st25r3916_get_interrupts() */
@@ -46,6 +47,7 @@ static fake_card_t g_cards[NCARDS];
 #define g_card_present (g_cards[0].present)
 
 static bool g_bad_coll; /* report a nonsense collision position */
+static bool g_ack_next; /* answer the next frame with a 4-bit ACK + a CRC error */
 
 static void add_card(int k, const uint8_t *uid, int len, uint8_t sak)
 {
@@ -185,6 +187,13 @@ static void card_transmit(void)
             }
         }
     }
+    g_fifo_lb = 0;
+    if (g_ack_next) {
+        g_fifo[0] = 0x0A;
+        g_fifo_len = 1;
+        g_fifo_lb = 4;
+        g_deferred |= (uint32_t)ST25R_IRQ_CRC << 16;
+    }
     /* Transmit finishes first (I_txe); the reply (I_rxe) or the no-response timeout (I_nre)
      * arrives as a separate, later interrupt. */
     g_irq |= FI_M(ST25R_IRQ_TXE);
@@ -261,6 +270,7 @@ static void reply(const uint8_t *b, int n, bool garbled)
     memcpy(g_fifo, b, n);
     g_fifo[n] = g_fifo[n + 1] = 0xCC;
     g_fifo_len = n + 2;
+    g_fifo_lb = 0;
     g_irq |= FI_M(ST25R_IRQ_TXE);
     g_deferred |= FI_M(ST25R_IRQ_RXE) | (garbled ? FI_E(ST25R_IRQ_CRC) : 0);
 }
@@ -567,7 +577,8 @@ static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
             } else if (a == ST25R_REG_FIFO_STATUS1) {
                 v = (uint8_t)(g_fifo_len & 0xFF);
             } else if (a == ST25R_REG_FIFO_STATUS2) {
-                v = (uint8_t)(((g_fifo_len >> 8) & 0x3) << ST25R_FIFO2_B9_B8_SHIFT);
+                v = (uint8_t)((((g_fifo_len >> 8) & 0x3) << ST25R_FIFO2_B9_B8_SHIFT) |
+                              ((g_fifo_lb & 7) << ST25R_FIFO2_LB_SHIFT));
             } else if (a == ST25R_REG_AUX_DISPLAY) {
                 v = (g_rega[ST25R_REG_OP_CONTROL] & ST25R_OP_EN) ? ST25R_AUX_OSC_OK : 0;
             } else {
@@ -787,6 +798,19 @@ int main(void)
     uint8_t tiny[2];
     CHECK_EQ(st25r3916_transceive(&d, sel, 16, ST25R_TX_ANTICOL, tiny, sizeof(tiny), NULL, 20),
              ST25R_ERR_NOMEM); /* the 5-byte answer does not fit 2 bytes */
+
+    /* ---- a 4-bit ACK comes back as a short frame even with the CRC check on ---- */
+    g_card_present = false; /* no answer from card_transmit; we stage the ACK ourselves */
+    {
+        uint8_t wr[6] = {0xA2, 0x04, 1, 2, 3, 4}, ack[4];
+        int ackbits = 0;
+        g_ack_next = true;
+        CHECK_EQ(st25r3916_transceive(&d, wr, 48, ST25R_TX_CRC, ack, sizeof(ack), &ackbits, 20), 1);
+        CHECK_EQ(ackbits, 4);
+        CHECK_EQ(ack[0] & 0x0F, 0x0A);
+        g_ack_next = false;
+    }
+    g_card_present = true;
 
     /* ================= Several cards: anticollision resolution ================= */
 
@@ -1087,6 +1111,10 @@ int main(void)
     CHECK_EQ(st25r3916_listen_respond(&d, ats, sizeof(ats), true, 20), ST25R_OK);
     CHECK_EQ(g_txlen, (int)sizeof(ats));
     CHECK(!memcmp(g_txbuf, ats, sizeof(ats)));
+    CHECK_EQ(st25r3916_listen_respond_bits(&d, (const uint8_t[]){0x0A}, 4, false, 20), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_NUM_TX_BYTES2], ST25R_NTX2(0, 4)); /* the 4-bit ACK */
+    CHECK_EQ(st25r3916_listen_respond_bits(&d, (const uint8_t[]){0x0A}, 4, true, 20),
+             ST25R_ERR_PARAM);
 
     /* ---- 7-byte-UID tag: level-1 SAK carries the cascade bit, level 2 is final ---- */
     st25r_nfca_target_t tgt7 = {.nfcid1 = {0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66},

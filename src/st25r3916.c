@@ -374,6 +374,19 @@ static int xfer(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags, uint
         return ST25R_ERR_COLLISION;
     }
     if (irq & IRQ_E(ST25R_IRQ_CRC | ST25R_IRQ_PAR)) {
+        /* A frame shorter than a byte (the 4-bit ACK/NAK of NFC Forum Type 2 tags and
+         * MIFARE) cannot carry a CRC: hand it over instead of calling it a CRC error. */
+        uint8_t fs[2];
+        st25r3916_read_regs(d, ST25R_REG_FIFO_STATUS1, fs, 2);
+        int count = fs[0] | ((fs[1] >> ST25R_FIFO2_B9_B8_SHIFT) << 8);
+        int lb = (fs[1] & ST25R_FIFO2_LB_MASK) >> ST25R_FIFO2_LB_SHIFT;
+        if (count == 1 && lb > 0 && rx_cap >= 1) {
+            st25r3916_read_fifo(d, rx, 1);
+            if (rx_bits) {
+                *rx_bits = lb;
+            }
+            return 1;
+        }
         return ST25R_ERR_CRC;
     }
     if (irq & IRQ_E(ST25R_IRQ_ERR1 | ST25R_IRQ_ERR2)) {
@@ -731,7 +744,7 @@ static int nfcf_xfer(st25r_t *d, const uint8_t *tx, int len, uint8_t *rx, int rx
     if (n < 1 || buf[0] < 1 || buf[0] > n) {
         return ST25R_ERR_FRAMING;
     }
-    int plen = buf[0] - 1;
+    int plen = n - 1; /* the payload and its CRC bytes, as without host LEN */
     if (plen > rx_cap) {
         return ST25R_ERR_NOMEM;
     }
@@ -1125,10 +1138,22 @@ int st25r3916_listen_respond(st25r_t *d, const uint8_t *tx, int tx_len, bool wit
     if (tx_len < 0 || tx_len > ST25R_FIFO_DEPTH) {
         return ST25R_ERR_PARAM;
     }
-    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, ST25R_NTX1(tx_len));
-    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, ST25R_NTX2(tx_len, 0));
-    if (tx_len > 0) {
-        st25r3916_write_fifo(d, tx, (size_t)tx_len);
+    return st25r3916_listen_respond_bits(d, tx, tx_len * 8, with_crc, timeout_ms);
+}
+
+int st25r3916_listen_respond_bits(st25r_t *d, const uint8_t *tx, int tx_bits, bool with_crc,
+                                  int timeout_ms)
+{
+    int nbytes = tx_bits / 8;
+    int nbits = tx_bits % 8;
+    int fifo = nbytes + (nbits ? 1 : 0);
+    if (tx_bits < 0 || fifo > ST25R_FIFO_DEPTH || (nbits && with_crc)) {
+        return ST25R_ERR_PARAM; /* a short frame (the 4-bit ACK) has no CRC (Table 71) */
+    }
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, ST25R_NTX1(nbytes));
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, ST25R_NTX2(nbytes, nbits));
+    if (fifo > 0) {
+        st25r3916_write_fifo(d, tx, (size_t)fifo);
     }
     st25r3916_get_interrupts(d);
     st25r3916_cmd(d, with_crc ? ST25R_CMD_TRANSMIT_WITH_CRC : ST25R_CMD_TRANSMIT_WITHOUT_CRC);

@@ -186,8 +186,10 @@ enum {
  * ST25R_ERR_*. The field must already be on.
  *
  * In the current protocol (d->tech): A and B as given (the chip adds and checks the CRC with
- * ST25R_TX_CRC; the answer keeps its 2 CRC bytes). F: whole bytes, without the LEN byte
- * either way, and always with CRC. V: whole bytes; the driver codes the frame, adds the CRC
+ * ST25R_TX_CRC; the answer keeps its 2 CRC bytes, as the chip leaves them in the FIFO;
+ * an answer shorter than a byte, like a 4-bit ACK, comes back as 1 byte with *rx_bits < 8
+ * even with ST25R_TX_CRC). F: whole bytes, without the LEN byte either way, always with
+ * CRC, the answer again keeping its 2 CRC bytes. V: whole bytes; the driver codes the frame, adds the CRC
  * with ST25R_TX_CRC and checks and strips it from the answer (st25r3916_nfcv_transceive).
  *
  * FeliCa LEN byte: DS13541 §4.4.4 says Transmit without CRC "skips the Length and CRC
@@ -344,6 +346,11 @@ st25r_listen_event_t st25r3916_listen_poll(st25r_t *d, uint8_t *rx, int rx_cap, 
  * listen mode. `with_crc` appends the ISO 14443 CRC. Returns ST25R_OK or a negative error. */
 int st25r3916_listen_respond(st25r_t *d, const uint8_t *tx, int tx_len, bool with_crc,
                              int timeout_ms);
+
+/* As st25r3916_listen_respond(), in bits: a frame shorter than a byte, like the 4-bit ACK
+ * a Type 2 tag sends after a WRITE (no CRC then). */
+int st25r3916_listen_respond_bits(st25r_t *d, const uint8_t *tx, int tx_bits, bool with_crc,
+                                  int timeout_ms);
 
 /* ---- RF: wake-up mode (low-power tag detection, DS13541 §4.5.67-69) ---------------------
  *
