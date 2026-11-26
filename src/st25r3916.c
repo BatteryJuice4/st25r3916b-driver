@@ -194,7 +194,71 @@ static uint32_t wait_irqs(st25r_t *d, uint32_t want, int timeout_ms)
     return 0;
 }
 
+int st25r3916_set_tech(st25r_t *d, st25r_tech_t tech, uint8_t br_tx, uint8_t br_rx)
+{
+    uint8_t om;
+    uint8_t am = 0;
+    st25r_analog_event_t ev;
+    if (br_tx > ST25R_BR_848 || br_rx > ST25R_BR_848) {
+        return ST25R_ERR_PARAM;
+    }
+    switch (tech) {
+    case ST25R_TECH_A:
+        om = ST25R_OM_ISO14443A;
+        ev = ST25R_ANALOG_POLL_A;
+        break;
+    case ST25R_TECH_B:
+        om = ST25R_OM_ISO14443B;
+        am = ST25R_MODE_TR_AM; /* ISO 14443-B is 10 % ASK (DS13541 §4.2.1) */
+        ev = ST25R_ANALOG_POLL_B;
+        break;
+    case ST25R_TECH_F:
+        if (br_tx == ST25R_BR_106 || br_tx == ST25R_BR_848 || br_rx == ST25R_BR_106 ||
+            br_rx == ST25R_BR_848) {
+            return ST25R_ERR_PARAM; /* FeliCa runs at 212 and 424 kbit/s only */
+        }
+        om = ST25R_OM_FELICA;
+        am = ST25R_MODE_TR_AM;
+        ev = ST25R_ANALOG_POLL_F;
+        break;
+    case ST25R_TECH_V:
+        om = ST25R_OM_SUBC_STREAM; /* the stream register sets the timing, not 0x04 */
+        am = d->nfcv_am ? ST25R_MODE_TR_AM : 0;
+        br_tx = br_rx = ST25R_BR_106;
+        ev = ST25R_ANALOG_POLL_V;
+        break;
+    default:
+        return ST25R_ERR_PARAM;
+    }
+    st25r3916_write_reg(d, ST25R_REG_MODE, (uint8_t)((om << ST25R_MODE_OM_SHIFT) | am));
+    st25r3916_write_reg(d, ST25R_REG_BIT_RATE,
+                        (uint8_t)((br_tx << ST25R_BR_TX_SHIFT) | (br_rx << ST25R_BR_RX_SHIFT)));
+    if (tech == ST25R_TECH_B || tech == ST25R_TECH_F) {
+        st25r3916_write_reg(d, ST25R_REG_ISO14443B_1, 0x00);
+        st25r3916_write_reg(d, ST25R_REG_ISO14443B_FELICA, 0x00);
+    }
+    if (tech == ST25R_TECH_V) {
+        /* 424 kHz subcarrier, 8 pulses (half an ISO 15693 bit) per report bit; Tx slots of
+         * fc/128. The driver frames and checks the CRC itself. */
+        st25r3916_write_reg(d, ST25R_REG_STREAM_MODE,
+                            (uint8_t)((ST25R_STREAM_SCF_424 << ST25R_STREAM_SCF_SHIFT) |
+                                      (ST25R_STREAM_SCP_8 << ST25R_STREAM_SCP_SHIFT) |
+                                      (ST25R_STREAM_STX_128 << ST25R_STREAM_STX_SHIFT)));
+        st25r3916_modify_reg(d, ST25R_REG_AUX, ST25R_AUXDEF_NO_CRC_RX, ST25R_AUXDEF_NO_CRC_RX);
+    } else {
+        st25r3916_modify_reg(d, ST25R_REG_AUX, ST25R_AUXDEF_NO_CRC_RX, 0);
+    }
+    d->tech = (uint8_t)tech;
+    st25r3916_apply_analog_config(d, ev);
+    return ST25R_OK;
+}
+
 int st25r3916_field_on(st25r_t *d)
+{
+    return st25r3916_field_on_tech(d, ST25R_TECH_A, ST25R_BR_106);
+}
+
+int st25r3916_field_on_tech(st25r_t *d, st25r_tech_t tech, uint8_t br)
 {
     st25r3916_cmd(d, ST25R_CMD_SET_DEFAULT);
     if (d->bus->delay_us) {
@@ -215,10 +279,11 @@ int st25r3916_field_on(st25r_t *d)
     }
     st25r3916_apply_analog_config(d, ST25R_ANALOG_POWER_UP);
 
-    /* NFC-A reader at 106 kbit/s: initiator, ISO14443A, standard framing. */
-    st25r3916_write_reg(d, ST25R_REG_MODE, (uint8_t)(ST25R_OM_ISO14443A << ST25R_MODE_OM_SHIFT));
-    st25r3916_write_reg(d, ST25R_REG_BIT_RATE,
-                        (uint8_t)((ST25R_BR_106 << ST25R_BR_TX_SHIFT) | (ST25R_BR_106 << ST25R_BR_RX_SHIFT)));
+    /* Reader (initiator) in the chosen protocol and bit rate. */
+    int rc = st25r3916_set_tech(d, tech, br, br);
+    if (rc != ST25R_OK) {
+        return rc;
+    }
 
     /* Match the regulated voltages to the supply. */
     st25r3916_get_interrupts(d);
@@ -228,7 +293,6 @@ int st25r3916_field_on(st25r_t *d)
     /* Enable the receiver and transmitter. */
     st25r3916_modify_reg(d, ST25R_REG_OP_CONTROL, ST25R_OP_RX_EN | ST25R_OP_TX_EN,
                          ST25R_OP_RX_EN | ST25R_OP_TX_EN);
-    st25r3916_apply_analog_config(d, ST25R_ANALOG_POLL_A); /* Rx/Tx analog for the antenna */
 
     /* Switch the field on with initial RF collision avoidance (does not transmit if another
      * reader's field is already present). I_cat means the field is on and the minimum guard
@@ -257,8 +321,14 @@ void st25r3916_field_off(st25r_t *d)
                          ST25R_OP_EN | ST25R_OP_RX_EN | ST25R_OP_TX_EN, 0);
 }
 
-int st25r3916_transceive(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags,
-                         uint8_t *rx, int rx_cap, int *rx_bits, int timeout_ms)
+static int nfcv_xfer(st25r_t *d, const uint8_t *req, int req_len, bool crc, uint8_t *resp,
+                     int resp_cap, int timeout_ms);
+static int nfcf_xfer(st25r_t *d, const uint8_t *tx, int len, uint8_t *rx, int rx_cap,
+                     int timeout_ms);
+
+/* The framed transceive in the chip's own framing (A, B, F). */
+static int xfer(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags, uint8_t *rx,
+                int rx_cap, int *rx_bits, int timeout_ms)
 {
     if (tx_bits < 0) {
         return ST25R_ERR_PARAM;
@@ -327,6 +397,24 @@ int st25r3916_transceive(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned fl
         *rx_bits = (lb && count) ? (count - 1) * 8 + lb : count * 8;
     }
     return count;
+}
+
+int st25r3916_transceive(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags,
+                         uint8_t *rx, int rx_cap, int *rx_bits, int timeout_ms)
+{
+    if (d->tech == ST25R_TECH_V || d->tech == ST25R_TECH_F) {
+        if (tx_bits < 0 || tx_bits % 8) {
+            return ST25R_ERR_PARAM; /* whole bytes only */
+        }
+        int n = d->tech == ST25R_TECH_V
+                    ? nfcv_xfer(d, tx, tx_bits / 8, (flags & ST25R_TX_CRC) != 0, rx, rx_cap, timeout_ms)
+                    : nfcf_xfer(d, tx, tx_bits / 8, rx, rx_cap, timeout_ms);
+        if (n >= 0 && rx_bits) {
+            *rx_bits = n * 8;
+        }
+        return n;
+    }
+    return xfer(d, tx, tx_bits, flags, rx, rx_cap, rx_bits, timeout_ms);
 }
 
 int st25r3916_nfca_request(st25r_t *d, uint8_t atqa[2], bool wupa)
@@ -497,7 +585,7 @@ int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out)
         /* SELECT: SEL + NVB=0x70 + the 4 UID bytes + BCC, with CRC. The card returns SAK. */
         uint8_t sel[7] = {SEL[lvl], 0x70, cln[0], cln[1], cln[2], cln[3], cln[4]};
         uint8_t sak[4];
-        rc = st25r3916_transceive(d, sel, 56, ST25R_TX_CRC, sak, sizeof(sak), NULL, 20);
+        rc = xfer(d, sel, 56, ST25R_TX_CRC, sak, sizeof(sak), NULL, 20);
         if (rc < 1) {
             return rc < 0 ? rc : ST25R_ERR_FRAMING;
         }
@@ -533,11 +621,388 @@ int st25r3916_nfca_halt(st25r_t *d)
      * it was not acknowledged (ISO 14443-3 §6.4.3). */
     static const uint8_t hlta[2] = {0x50, 0x00};
     uint8_t rx[4];
-    int rc = st25r3916_transceive(d, hlta, 16, ST25R_TX_CRC, rx, sizeof(rx), NULL, 2);
+    int rc = xfer(d, hlta, 16, ST25R_TX_CRC, rx, sizeof(rx), NULL, 2);
     if (rc == ST25R_ERR_TIMEOUT) {
         return ST25R_OK;
     }
     return rc < 0 ? rc : ST25R_ERR_FRAMING;
+}
+
+/* ===== RF: ISO 14443-B reader ===========================================================
+ * UNTESTED ON HARDWARE. ISO 14443-3 §7. The chip adds SOF/EOF and CRC_B. */
+
+static int nfcb_frame(st25r_t *d, const uint8_t *tx, int n, uint8_t *rx, int cap)
+{
+    return xfer(d, tx, n * 8, ST25R_TX_CRC, rx, cap, NULL, 10);
+}
+
+int st25r3916_nfcb_poll(st25r_t *d, uint8_t afi, bool wupb, st25r_nfcb_t *out, int max)
+{
+    int found = 0;
+    /* Round 0 asks with one slot; if answers collide, ask with 16 (N code 4) and walk the
+     * slots with Slot-MARKERs (APn = (n - 1) << 4 | 5), a few times, as ISO 14443-3 §7.4. */
+    for (int round = 0; round < 4 && found < max; round++) {
+        int nslots = round == 0 ? 1 : 16;
+        bool collided = false;
+        for (int slot = 1; slot <= nslots && found < max; slot++) {
+            uint8_t rx[20];
+            int rc;
+            if (slot == 1) {
+                uint8_t req[3] = {0x05, afi, (uint8_t)((wupb ? 0x08 : 0x00) | (round ? 4 : 0))};
+                rc = nfcb_frame(d, req, 3, rx, sizeof(rx));
+            } else {
+                uint8_t marker = (uint8_t)(((slot - 1) << 4) | 0x05);
+                rc = nfcb_frame(d, &marker, 1, rx, sizeof(rx));
+            }
+            if (rc == ST25R_ERR_TIMEOUT) {
+                continue; /* nobody in this slot */
+            }
+            if (rc == ST25R_ERR_CRC || rc == ST25R_ERR_FRAMING || rc == ST25R_ERR_COLLISION ||
+                rc == ST25R_ERR_NOMEM || (rc >= 0 && (rc < 12 || rx[0] != 0x50))) {
+                collided = true; /* two cards in one slot garble each other */
+                continue;
+            }
+            if (rc < 0) {
+                return rc;
+            }
+            bool dup = false;
+            for (int i = 0; i < found; i++) {
+                dup |= !memcmp(out[i].pupi, rx + 1, 4);
+            }
+            if (!dup) {
+                memcpy(out[found].pupi, rx + 1, 4);
+                memcpy(out[found].app_data, rx + 5, 4);
+                memcpy(out[found].prot_info, rx + 9, 3);
+                found++;
+            }
+        }
+        if (!collided) {
+            break;
+        }
+    }
+    return found;
+}
+
+int st25r3916_nfcb_attrib(st25r_t *d, const st25r_nfcb_t *card)
+{
+    /* ATTRIB: 1D, PUPI, Param 1 (default TR0/TR1, SOF/EOF), Param 2 (106 kbit/s both ways,
+     * FSDI 8 = 256 bytes), Param 3 (the protocol type from the ATQB), Param 4 (CID 0). */
+    uint8_t tx[9] = {0x1D, card->pupi[0], card->pupi[1], card->pupi[2], card->pupi[3],
+                     0x00, 0x08, (uint8_t)(card->prot_info[1] & 0x0F), 0x00};
+    uint8_t rx[8];
+    int rc = nfcb_frame(d, tx, 9, rx, sizeof(rx));
+    if (rc < 0) {
+        return rc;
+    }
+    return rc < 1 ? ST25R_ERR_FRAMING : rx[0];
+}
+
+int st25r3916_nfcb_halt(st25r_t *d, const uint8_t pupi[4])
+{
+    uint8_t tx[5] = {0x50, pupi[0], pupi[1], pupi[2], pupi[3]};
+    uint8_t rx[4];
+    int rc = nfcb_frame(d, tx, 5, rx, sizeof(rx));
+    if (rc < 0) {
+        return rc;
+    }
+    return (rc >= 1 && rx[0] == 0x00) ? ST25R_OK : ST25R_ERR_FRAMING;
+}
+
+/* ===== RF: FeliCa reader ================================================================
+ * UNTESTED ON HARDWARE. The chip adds the preamble, sync code and CRC (DS13541 §4.4.4). */
+
+static int nfcf_xfer(st25r_t *d, const uint8_t *tx, int len, uint8_t *rx, int rx_cap,
+                     int timeout_ms)
+{
+    if (!d->nfcf_host_len) {
+        return xfer(d, tx, len * 8, ST25R_TX_CRC, rx, rx_cap, NULL, timeout_ms);
+    }
+    /* The host's LEN byte: LEN counts itself and the payload, not the CRC. */
+    uint8_t buf[256];
+    if (len < 0 || len > 254) {
+        return ST25R_ERR_PARAM;
+    }
+    buf[0] = (uint8_t)(len + 1);
+    memcpy(buf + 1, tx, (size_t)len);
+    int n = xfer(d, buf, (len + 1) * 8, ST25R_TX_CRC, buf, sizeof(buf), NULL, timeout_ms);
+    if (n < 0) {
+        return n;
+    }
+    if (n < 1 || buf[0] < 1 || buf[0] > n) {
+        return ST25R_ERR_FRAMING;
+    }
+    int plen = buf[0] - 1;
+    if (plen > rx_cap) {
+        return ST25R_ERR_NOMEM;
+    }
+    memcpy(rx, buf + 1, (size_t)plen);
+    return plen;
+}
+
+int st25r3916_nfcf_poll(st25r_t *d, uint16_t sys_code, uint8_t rc, uint8_t tsn,
+                        st25r_nfcf_t *out)
+{
+    if (tsn != 0 && tsn != 1 && tsn != 3 && tsn != 7 && tsn != 15) {
+        return ST25R_ERR_PARAM;
+    }
+    memset(out, 0, sizeof(*out));
+    /* SENSF_REQ: 00, system code, request code, time slots. Answers come in slots of
+     * 1.2 ms after a 2.4 ms wait; the chip keeps the first clean frame. */
+    uint8_t req[5] = {0x00, (uint8_t)(sys_code >> 8), (uint8_t)sys_code, rc, tsn};
+    uint8_t rx[24];
+    int n = nfcf_xfer(d, req, 5, rx, sizeof(rx), 4 + 2 * (tsn + 1));
+    if (n < 0) {
+        return n;
+    }
+    if (n < 17 || rx[0] != 0x01) {
+        return ST25R_ERR_FRAMING;
+    }
+    memcpy(out->idm, rx + 1, 8);
+    memcpy(out->pmm, rx + 9, 8);
+    if (rc != 0 && n >= 19) {
+        out->rd[0] = rx[17];
+        out->rd[1] = rx[18];
+        out->has_rd = true;
+    }
+    return ST25R_OK;
+}
+
+/* ===== RF: ISO 15693 reader (stream mode, driver-side coding) ===========================
+ * UNTESTED ON HARDWARE; see the header for the stream-format assumptions. */
+
+uint16_t st25r_nfcv_crc(const uint8_t *data, int len)
+{
+    uint16_t crc = 0xFFFF; /* ISO/IEC 13239: poly x^16+x^12+x^5+1 reflected, init FFFF */
+    for (int i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0x8408) : (uint16_t)(crc >> 1);
+        }
+    }
+    return (uint16_t)~crc;
+}
+
+int st25r_nfcv_encode(const uint8_t *data, int len, uint8_t *out, int cap)
+{
+    /* Each FIFO bit is one 9.44 us slot, LSB first. 1-out-of-4 (ISO 15693-2 §7.2): each
+     * pair of bits, least significant pair first, is a 75.52 us symbol of 8 slots with one
+     * pulse in slot 2v+1. SOF: pulses in slots 0 and 5; EOF: a pulse in slot 2. */
+    if (len < 0 || cap < 4 * len + 2) {
+        return ST25R_ERR_NOMEM;
+    }
+    int n = 0;
+    out[n++] = 0x21;
+    for (int i = 0; i < len; i++) {
+        for (int p = 0; p < 4; p++) {
+            int v = (data[i] >> (2 * p)) & 3;
+            out[n++] = (uint8_t)(1u << (2 * v + 1));
+        }
+    }
+    out[n++] = 0x04;
+    return n;
+}
+
+static int sbit(const uint8_t *s, int i)
+{
+    return (s[i / 8] >> (i % 8)) & 1;
+}
+
+/* EOF from the card: logic 0 (sub-carrier, quiet), 24 pulses (3 report bits), quiet. */
+static bool nfcv_is_eof(const uint8_t *s, int nbits, int i)
+{
+    static const uint8_t eof[5] = {1, 0, 1, 1, 1};
+    for (int k = 0; k < 5; k++) {
+        if (i + k >= nbits || sbit(s, i + k) != eof[k]) {
+            return false;
+        }
+    }
+    return i + 5 >= nbits || !sbit(s, i + 5);
+}
+
+int st25r_nfcv_decode(const uint8_t *stream, int nbits, uint8_t *out, int cap)
+{
+    /* One report bit per half data bit; 1 = sub-carrier seen. The receiver starts on the
+     * first sub-carrier, so the SOF's leading quiet part is not there: 1 1 1 (24 pulses),
+     * then logic 1 (quiet, sub-carrier). Data: logic 0 = 1 0, logic 1 = 0 1, LSB first;
+     * 1 1 means two cards answered different bits (a collision). */
+    static const uint8_t sof[5] = {1, 1, 1, 0, 1};
+    int i = 0;
+    while (i < nbits && i < 8 && !sbit(stream, i)) {
+        i++; /* tolerate a few quiet report bits before the frame */
+    }
+    for (int k = 0; k < 5; k++, i++) {
+        if (i >= nbits || sbit(stream, i) != sof[k]) {
+            return ST25R_ERR_FRAMING;
+        }
+    }
+    int n = 0;
+    while (!nfcv_is_eof(stream, nbits, i)) {
+        uint8_t byte = 0;
+        for (int b = 0; b < 8; b++, i += 2) {
+            if (i + 1 >= nbits) {
+                return ST25R_ERR_FRAMING; /* ran out before an EOF */
+            }
+            int h1 = sbit(stream, i), h2 = sbit(stream, i + 1);
+            if (h1 && h2) {
+                return ST25R_ERR_COLLISION;
+            }
+            if (!h1 && !h2) {
+                return ST25R_ERR_FRAMING;
+            }
+            if (h2) {
+                byte |= (uint8_t)(1u << b);
+            }
+        }
+        if (n >= cap) {
+            return ST25R_ERR_NOMEM;
+        }
+        out[n++] = byte;
+    }
+    return n;
+}
+
+static int nfcv_xfer(st25r_t *d, const uint8_t *req, int req_len, bool crc, uint8_t *resp,
+                     int resp_cap, int timeout_ms)
+{
+    uint8_t frame[ST25R_NFCV_MAX_REQ + 2];
+    uint8_t buf[4 * (ST25R_NFCV_MAX_REQ + 2) + 2]; /* the coded request, then the answer */
+    if (req_len < 1 || req_len > ST25R_NFCV_MAX_REQ) {
+        return ST25R_ERR_PARAM;
+    }
+    memcpy(frame, req, (size_t)req_len);
+    int flen = req_len;
+    if (crc) {
+        uint16_t c = st25r_nfcv_crc(frame, req_len);
+        frame[flen++] = (uint8_t)c;
+        frame[flen++] = (uint8_t)(c >> 8);
+    }
+    int n = st25r_nfcv_encode(frame, flen, buf, sizeof(buf));
+    if (n < 0) {
+        return n;
+    }
+
+    st25r3916_cmd(d, ST25R_CMD_STOP);
+    st25r3916_cmd(d, ST25R_CMD_RESET_RXGAIN);
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES1, ST25R_NTX1(n));
+    st25r3916_write_reg(d, ST25R_REG_NUM_TX_BYTES2, ST25R_NTX2(n, 0));
+    st25r3916_write_fifo(d, buf, (size_t)n);
+    st25r3916_get_interrupts(d);
+    st25r3916_cmd(d, ST25R_CMD_TRANSMIT_WITHOUT_CRC);
+    /* ~0.6 ms per request byte at 26 kbit/s; allow for it on top of the answer's wait. */
+    if (!(wait_irqs(d, IRQ_M(ST25R_IRQ_TXE), 5 + flen) & IRQ_M(ST25R_IRQ_TXE))) {
+        return ST25R_ERR_TIMEOUT;
+    }
+    uint32_t irq = wait_irqs(d, IRQ_M(ST25R_IRQ_RXE) | IRQ_T(ST25R_IRQ_NRE) |
+                                    IRQ_E(ST25R_IRQ_ERR1 | ST25R_IRQ_ERR2), timeout_ms);
+    if (!(irq & IRQ_M(ST25R_IRQ_RXE))) {
+        return (irq & IRQ_E(ST25R_IRQ_ERR1 | ST25R_IRQ_ERR2)) ? ST25R_ERR_FRAMING
+                                                               : ST25R_ERR_TIMEOUT;
+    }
+
+    uint8_t fs[2];
+    st25r3916_read_regs(d, ST25R_REG_FIFO_STATUS1, fs, 2);
+    int count = fs[0] | ((fs[1] >> ST25R_FIFO2_B9_B8_SHIFT) << 8);
+    int lb = (fs[1] & ST25R_FIFO2_LB_MASK) >> ST25R_FIFO2_LB_SHIFT;
+    if (count > (2 * (ST25R_NFCV_MAX_RESP + 2) + 2) || count > (int)sizeof(buf)) {
+        return ST25R_ERR_NOMEM;
+    }
+    if (count > 0) {
+        st25r3916_read_fifo(d, buf, (size_t)count);
+    }
+    int nbits = (lb && count) ? (count - 1) * 8 + lb : count * 8;
+    uint8_t dec[ST25R_NFCV_MAX_RESP + 2];
+    int m = st25r_nfcv_decode(buf, nbits, dec, sizeof(dec));
+    if (m < 0) {
+        return m;
+    }
+    if (crc) {
+        if (m < 3) {
+            return ST25R_ERR_FRAMING;
+        }
+        uint16_t c = st25r_nfcv_crc(dec, m - 2);
+        if (dec[m - 2] != (uint8_t)c || dec[m - 1] != (uint8_t)(c >> 8)) {
+            return ST25R_ERR_CRC;
+        }
+        m -= 2;
+    }
+    if (m > resp_cap) {
+        return ST25R_ERR_NOMEM;
+    }
+    memcpy(resp, dec, (size_t)m);
+    return m;
+}
+
+int st25r3916_nfcv_transceive(st25r_t *d, const uint8_t *req, int req_len, uint8_t *resp,
+                              int resp_cap, int timeout_ms)
+{
+    return nfcv_xfer(d, req, req_len, true, resp, resp_cap, timeout_ms);
+}
+
+/* One-slot INVENTORY with a `mlen`-bit mask (the UID's low bits). */
+static int nfcv_inventory1(st25r_t *d, int mlen, const uint8_t mask[8], st25r_nfcv_t *card)
+{
+    uint8_t req[3 + 8] = {0x26, 0x01, (uint8_t)mlen}; /* high rate, inventory, 1 slot */
+    int mb = (mlen + 7) / 8;
+    for (int i = 0; i < mb; i++) {
+        req[3 + i] = mask[i];
+    }
+    if (mlen % 8) {
+        req[3 + mb - 1] &= (uint8_t)((1u << (mlen % 8)) - 1u);
+    }
+    uint8_t resp[16];
+    int rc = nfcv_xfer(d, req, 3 + mb, true, resp, sizeof(resp), 20);
+    if (rc == ST25R_ERR_CRC) {
+        return ST25R_ERR_COLLISION; /* answers that overlap badly fail the CRC */
+    }
+    if (rc < 0) {
+        return rc;
+    }
+    if (rc < 10 || (resp[0] & 0x01)) {
+        return ST25R_ERR_FRAMING;
+    }
+    card->dsfid = resp[1];
+    memcpy(card->uid, resp + 2, 8);
+    return ST25R_OK;
+}
+
+int st25r3916_nfcv_inventory(st25r_t *d, st25r_nfcv_t *out, int max)
+{
+    /* Depth-first search over the UID's bits: a collision with an n-bit mask means two or
+     * more cards share those bits, so ask with n+1 bits (0 first, then 1). Every bit in the
+     * mask was added at a collision, so backtracking flips the deepest 0 to 1. */
+    uint8_t mask[8] = {0};
+    int len = 0;
+    int found = 0;
+    for (int guard = 0; guard < 4 * 64 + 8 && found < max; guard++) {
+        st25r_nfcv_t c;
+        int rc = nfcv_inventory1(d, len, mask, &c);
+        if (rc == ST25R_ERR_COLLISION && len < 64) {
+            mask[len / 8] &= (uint8_t)~(1u << (len % 8));
+            len++;
+            continue;
+        }
+        if (rc == ST25R_OK) {
+            bool dup = false;
+            for (int i = 0; i < found; i++) {
+                dup |= !memcmp(out[i].uid, c.uid, 8);
+            }
+            if (!dup) {
+                out[found++] = c;
+            }
+        } else if (rc != ST25R_ERR_TIMEOUT && rc != ST25R_ERR_COLLISION &&
+                   rc != ST25R_ERR_FRAMING) {
+            return rc;
+        }
+        while (len > 0 && (mask[(len - 1) / 8] & (1u << ((len - 1) % 8)))) {
+            mask[(len - 1) / 8] &= (uint8_t)~(1u << ((len - 1) % 8));
+            len--;
+        }
+        if (len == 0) {
+            break;
+        }
+        mask[(len - 1) / 8] |= (uint8_t)(1u << ((len - 1) % 8));
+    }
+    return found;
 }
 
 /* ===== RF: ISO 14443-A card emulation (listen / target mode, DS13541 §4.2.14) ==========

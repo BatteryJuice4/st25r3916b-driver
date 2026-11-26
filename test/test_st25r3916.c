@@ -214,6 +214,309 @@ static int cards_request(bool wupa)
     return n;
 }
 
+
+/* ---- Type B, FeliCa and ISO 15693 cards ------------------------------------------------ */
+#define FI_E(bit) ((uint32_t)(bit) << 16)
+
+typedef struct {
+    bool present;
+    uint8_t pupi[4];
+    uint8_t afi;
+    int state; /* CARD_IDLE, CARD_READY (answered), CARD_ACTIVE (ATTRIB), CARD_HALT */
+    int slot;  /* slot chosen for the current REQB */
+} fake_b_t;
+static fake_b_t g_bcards[3];
+static int g_b_nslots;
+static uint8_t g_last_b_attrib[9];
+
+typedef struct {
+    bool present;
+    uint8_t idm[8];
+    uint8_t pmm[8];
+    uint16_t sys;
+} fake_f_t;
+static fake_f_t g_fcards[3];
+static uint8_t g_last_f_tx[32];
+static int g_last_f_len;
+
+typedef struct {
+    bool present;
+    uint8_t uid[8];
+    uint8_t dsfid;
+} fake_v_t;
+static fake_v_t g_vcards[4];
+static int g_v_requests;
+static uint8_t g_v_last_req[80];
+static int g_v_last_len;
+
+static int fake_om(void)
+{
+    return (g_rega[ST25R_REG_MODE] & ST25R_MODE_OM_MASK) >> ST25R_MODE_OM_SHIFT;
+}
+
+/* Reply with `n` bytes (+ 2 fake CRC bytes the chip would have checked), or a CRC error
+ * when `garbled` (answers overlapping on the air). */
+static void reply(const uint8_t *b, int n, bool garbled)
+{
+    memcpy(g_fifo, b, n);
+    g_fifo[n] = g_fifo[n + 1] = 0xCC;
+    g_fifo_len = n + 2;
+    g_irq |= FI_M(ST25R_IRQ_TXE);
+    g_deferred |= FI_M(ST25R_IRQ_RXE) | (garbled ? FI_E(ST25R_IRQ_CRC) : 0);
+}
+
+static void no_reply(void)
+{
+    g_fifo_len = 0;
+    g_irq |= FI_M(ST25R_IRQ_TXE);
+    g_deferred |= FI_T(ST25R_IRQ_NRE);
+}
+
+static void card_b_transmit(void)
+{
+    const uint8_t *f = g_txbuf;
+    int n = g_txlen;
+    int slot = 0;
+    if (n == 3 && f[0] == 0x05) { /* REQB / WUPB */
+        bool wup = f[2] & 0x08;
+        g_b_nslots = 1 << (f[2] & 7);
+        for (int k = 0; k < 3; k++) {
+            fake_b_t *c = &g_bcards[k];
+            if (!c->present || (c->state == CARD_HALT && !wup) || c->state == CARD_ACTIVE ||
+                (f[1] && f[1] != c->afi)) {
+                c->slot = 0;
+                continue;
+            }
+            c->state = CARD_READY;
+            c->slot = 1 + (c->pupi[0] % g_b_nslots); /* "random" */
+        }
+        slot = 1;
+    } else if (n == 1 && (f[0] & 0x0F) == 0x05) { /* Slot-MARKER */
+        slot = (f[0] >> 4) + 1;
+    } else if (n == 9 && f[0] == 0x1D) { /* ATTRIB */
+        memcpy(g_last_b_attrib, f, 9);
+        for (int k = 0; k < 3; k++) {
+            fake_b_t *c = &g_bcards[k];
+            if (c->present && c->state == CARD_READY && !memcmp(c->pupi, f + 1, 4)) {
+                c->state = CARD_ACTIVE;
+                reply((uint8_t[]){0x10}, 1, false); /* MBLI 1, CID 0 */
+                return;
+            }
+        }
+        no_reply();
+        return;
+    } else if (n == 5 && f[0] == 0x50) { /* HLTB */
+        for (int k = 0; k < 3; k++) {
+            fake_b_t *c = &g_bcards[k];
+            if (c->present && !memcmp(c->pupi, f + 1, 4)) {
+                c->state = CARD_HALT;
+                reply((uint8_t[]){0x00}, 1, false);
+                return;
+            }
+        }
+        no_reply();
+        return;
+    }
+    int who = -1, count = 0;
+    for (int k = 0; k < 3; k++) {
+        if (g_bcards[k].present && g_bcards[k].state == CARD_READY && g_bcards[k].slot == slot &&
+            slot > 0) {
+            who = k;
+            count++;
+        }
+    }
+    if (count == 0) {
+        no_reply();
+        return;
+    }
+    fake_b_t *c = &g_bcards[who];
+    uint8_t atqb[12] = {0x50, c->pupi[0], c->pupi[1], c->pupi[2], c->pupi[3], c->afi, 0, 0, 0,
+                        0x00, 0x81, 0x71}; /* 256-byte frames, ISO 14443-4 */
+    reply(atqb, 12, count > 1);
+}
+
+static void card_f_transmit(void)
+{
+    g_last_f_len = g_txlen < 32 ? g_txlen : 32;
+    memcpy(g_last_f_tx, g_txbuf, g_last_f_len);
+    const uint8_t *f = g_txbuf;
+    int n = g_txlen;
+    int host_len = 0;
+    if (n >= 1 && f[0] == n) { /* the host wrote a LEN byte */
+        host_len = 1;
+        f++;
+        n--;
+    }
+    if (n != 5 || f[0] != 0x00) {
+        no_reply();
+        return;
+    }
+    uint16_t sc = (uint16_t)((f[1] << 8) | f[2]);
+    int nslots = f[4] + 1;
+    for (int slot = 0; slot < nslots; slot++) {
+        int who = -1, count = 0;
+        for (int k = 0; k < 3; k++) {
+            fake_f_t *c = &g_fcards[k];
+            if (c->present && (sc == 0xFFFF || sc == c->sys) && c->idm[7] % nslots == slot) {
+                who = k;
+                count++;
+            }
+        }
+        if (count == 0) {
+            continue;
+        }
+        uint8_t res[21];
+        int m = 0;
+        if (host_len) {
+            m++; /* LEN, filled below */
+        }
+        res[m++] = 0x01;
+        memcpy(res + m, g_fcards[who].idm, 8);
+        m += 8;
+        memcpy(res + m, g_fcards[who].pmm, 8);
+        m += 8;
+        if (f[3] == 1) {
+            res[m++] = (uint8_t)(g_fcards[who].sys >> 8);
+            res[m++] = (uint8_t)g_fcards[who].sys;
+        }
+        if (host_len) {
+            res[0] = (uint8_t)m;
+        }
+        reply(res, m, count > 1); /* the chip keeps the first slot that had an answer */
+        return;
+    }
+    no_reply();
+}
+
+/* The fake's own ISO 15693 coding, written separately from the driver's. */
+static uint16_t v_crc(const uint8_t *p, int n)
+{
+    uint16_t crc = 0xFFFF;
+    while (n--) {
+        crc ^= *p++;
+        for (int b = 0; b < 8; b++) {
+            crc = (crc >> 1) ^ ((crc & 1) ? 0x8408 : 0);
+        }
+    }
+    return (uint16_t)(crc ^ 0xFFFF);
+}
+
+/* Read a 1-out-of-4 request from the Tx stream; returns its length or -1. */
+static int v_read_request(const uint8_t *st, int nbytes, uint8_t *out)
+{
+    if (nbytes < 2 || st[0] != 0x21) {
+        return -1;
+    }
+    int n = 0;
+    int i = 1;
+    for (; i + 4 <= nbytes - 1; i += 4) {
+        uint8_t v = 0;
+        for (int p = 0; p < 4; p++) {
+            int slot = -1;
+            for (int b = 0; b < 8; b++) {
+                if (st[i + p] == (1u << b)) {
+                    slot = b;
+                }
+            }
+            if (slot < 0 || !(slot & 1)) {
+                return -1;
+            }
+            v |= (uint8_t)(((slot - 1) / 2) << (2 * p));
+        }
+        out[n++] = v;
+    }
+    return (i == nbytes - 1 && st[i] == 0x04) ? n : -1;
+}
+
+static void v_put(uint8_t *st, int *nb, int bit)
+{
+    if (bit) {
+        st[*nb / 8] |= (uint8_t)(1u << (*nb % 8));
+    }
+    (*nb)++;
+}
+
+/* The answer as report bits: SOF (minus its quiet start), Manchester data, EOF. ORed into
+ * `st` so two cards answering at once overlap like they would on the air. */
+static int v_answer_stream(const uint8_t *data, int n, uint8_t *st)
+{
+    int nb = 0;
+    static const int sof[5] = {1, 1, 1, 0, 1};
+    for (int k = 0; k < 5; k++) {
+        v_put(st, &nb, sof[k]);
+    }
+    for (int i = 0; i < n; i++) {
+        for (int b = 0; b < 8; b++) {
+            int one = (data[i] >> b) & 1;
+            v_put(st, &nb, !one);
+            v_put(st, &nb, one);
+        }
+    }
+    static const int eof[8] = {1, 0, 1, 1, 1, 0, 0, 0};
+    for (int k = 0; k < 8; k++) {
+        v_put(st, &nb, eof[k]);
+    }
+    return (nb + 7) / 8;
+}
+
+static void card_v_transmit(void)
+{
+    uint8_t req[80];
+    int n = v_read_request(g_txbuf, g_txlen, req);
+    g_v_requests++;
+    if (n < 3 || v_crc(req, n - 2) != (uint16_t)(req[n - 2] | (req[n - 1] << 8))) {
+        no_reply();
+        return;
+    }
+    g_v_last_len = n - 2;
+    memcpy(g_v_last_req, req, n - 2);
+    memset(g_fifo, 0, sizeof(g_fifo));
+    int len = 0, answered = 0;
+    for (int k = 0; k < 4; k++) {
+        fake_v_t *c = &g_vcards[k];
+        if (!c->present) {
+            continue;
+        }
+        uint8_t res[16];
+        int m = 0;
+        if (req[1] == 0x01 && (req[0] & 0x04)) { /* INVENTORY with mask */
+            int mlen = req[2];
+            bool match = true;
+            for (int i = 0; i < mlen; i++) {
+                match &= ((c->uid[i / 8] >> (i % 8)) & 1) == ((req[3 + i / 8] >> (i % 8)) & 1);
+            }
+            if (!match) {
+                continue;
+            }
+            res[m++] = 0x00;
+            res[m++] = c->dsfid;
+            memcpy(res + m, c->uid, 8);
+            m += 8;
+        } else if (req[1] == 0x20 && n >= 13 && !memcmp(req + 2, c->uid, 8)) { /* READ SINGLE
+                                                                                BLOCK */
+            res[m++] = 0x00;
+            for (int b = 0; b < 4; b++) {
+                res[m++] = (uint8_t)(req[10] * 4 + b);
+            }
+        } else {
+            continue;
+        }
+        uint16_t crc = v_crc(res, m);
+        res[m++] = (uint8_t)crc;
+        res[m++] = (uint8_t)(crc >> 8);
+        int l = v_answer_stream(res, m, g_fifo);
+        len = l > len ? l : len;
+        answered++;
+    }
+    if (!answered) {
+        no_reply();
+        return;
+    }
+    g_fifo_len = len;
+    g_irq |= FI_M(ST25R_IRQ_TXE);
+    g_deferred |= FI_M(ST25R_IRQ_RXE);
+}
+
 static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
 {
     (void)ctx;
@@ -331,7 +634,15 @@ static void fake_txn(void *ctx, const uint8_t *tx, uint8_t *rx, size_t n)
             break;
         case ST25R_CMD_TRANSMIT_WITH_CRC:
         case ST25R_CMD_TRANSMIT_WITHOUT_CRC:
-            card_transmit();
+            if (fake_om() == ST25R_OM_ISO14443B) {
+                card_b_transmit();
+            } else if (fake_om() == ST25R_OM_FELICA) {
+                card_f_transmit();
+            } else if (fake_om() == ST25R_OM_SUBC_STREAM) {
+                card_v_transmit();
+            } else {
+                card_transmit();
+            }
             break;
         case ST25R_CMD_MEASURE_AMPLITUDE:
             g_rega[ST25R_REG_AMPLITUDE_MEAS_DISPLAY] = g_sim_amp;
@@ -554,6 +865,189 @@ int main(void)
     CHECK_EQ(st25r3916_nfca_select(&d, &card), ST25R_ERR_FRAMING);
     g_bad_coll = false;
     memset(g_cards, 0, sizeof(g_cards));
+
+    /* ================= Other protocols and bit rates ================= */
+
+    /* ---- set_tech: registers per protocol, rate checks, the analog event ---- */
+    reset_chip();
+    CHECK_EQ(st25r3916_field_on(&d), ST25R_OK);
+    CHECK_EQ(d.tech, ST25R_TECH_A);
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_A, ST25R_BR_424, ST25R_BR_424), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_BIT_RATE], 0x22); /* after an ISO 14443-4 PPS */
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_A, 4, 0), ST25R_ERR_PARAM);
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_F, ST25R_BR_106, ST25R_BR_106), ST25R_ERR_PARAM);
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_F, ST25R_BR_212, ST25R_BR_212), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_MODE], (ST25R_OM_FELICA << ST25R_MODE_OM_SHIFT) | ST25R_MODE_TR_AM);
+    CHECK_EQ(g_rega[ST25R_REG_BIT_RATE], 0x11);
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_V, 0, 0), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_MODE], ST25R_OM_SUBC_STREAM << ST25R_MODE_OM_SHIFT); /* OOK */
+    CHECK_EQ(g_rega[ST25R_REG_STREAM_MODE], 0x38); /* 424 kHz, 8 pulses, fc/128 */
+    CHECK(g_rega[ST25R_REG_AUX] & ST25R_AUXDEF_NO_CRC_RX);
+    d.nfcv_am = true;
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_V, 0, 0), ST25R_OK);
+    CHECK(g_rega[ST25R_REG_MODE] & ST25R_MODE_TR_AM);
+    d.nfcv_am = false;
+    static const st25r_analog_entry_t b_tab[] = {
+        {ST25R_ANALOG_POLL_B, ST25R_REG_TX_DRIVER, 0xF0, 0x20, 0}, /* 10 % AM index */
+    };
+    static const st25r_analog_config_t b_cfg = {b_tab, 1};
+    d.analog = &b_cfg;
+    CHECK_EQ(st25r3916_set_tech(&d, ST25R_TECH_B, ST25R_BR_106, ST25R_BR_106), ST25R_OK);
+    CHECK_EQ(g_rega[ST25R_REG_MODE], (ST25R_OM_ISO14443B << ST25R_MODE_OM_SHIFT) | ST25R_MODE_TR_AM);
+    CHECK_EQ(g_rega[ST25R_REG_TX_DRIVER] & 0xF0, 0x20);
+    CHECK(!(g_rega[ST25R_REG_AUX] & ST25R_AUXDEF_NO_CRC_RX));
+    d.analog = NULL;
+
+    /* ---- ISO 14443-B: one card: REQB, ATTRIB, HLTB, WUPB ---- */
+    reset_chip();
+    memset(g_bcards, 0, sizeof(g_bcards));
+    g_bcards[0] = (fake_b_t){.present = true, .pupi = {0x11, 0x22, 0x33, 0x44}, .afi = 0x00};
+    CHECK_EQ(st25r3916_field_on_tech(&d, ST25R_TECH_B, ST25R_BR_106), ST25R_OK);
+    CHECK_EQ(d.tech, ST25R_TECH_B);
+    st25r_nfcb_t bc[3];
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0, false, bc, 3), 1);
+    CHECK(!memcmp(bc[0].pupi, g_bcards[0].pupi, 4));
+    CHECK_EQ(bc[0].prot_info[1], 0x81);
+    CHECK_EQ(st25r3916_nfcb_attrib(&d, &bc[0]), 0x10);
+    CHECK_EQ(g_last_b_attrib[6], 0x08);  /* FSDI 256 bytes, 106 kbit/s */
+    CHECK_EQ(g_last_b_attrib[7], 0x01);  /* protocol type from the ATQB */
+    CHECK_EQ(st25r3916_nfcb_halt(&d, bc[0].pupi), ST25R_OK);
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0, false, bc, 3), 0); /* halted: REQB ignored */
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0, true, bc, 3), 1);  /* WUPB wakes it */
+
+    /* ---- ISO 14443-B: three cards collide in one slot; 16 slots separate them ---- */
+    memset(g_bcards, 0, sizeof(g_bcards));
+    g_bcards[0] = (fake_b_t){.present = true, .pupi = {0x00, 1, 1, 1}};
+    g_bcards[1] = (fake_b_t){.present = true, .pupi = {0x01, 2, 2, 2}};
+    g_bcards[2] = (fake_b_t){.present = true, .pupi = {0x05, 3, 3, 3}, .afi = 0x10};
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0, false, bc, 3), 3);
+    int bseen = 0;
+    for (int i = 0; i < 3; i++) {
+        for (int k = 0; k < 3; k++) {
+            if (!memcmp(bc[i].pupi, g_bcards[k].pupi, 4)) {
+                bseen |= 1 << k;
+            }
+        }
+    }
+    CHECK_EQ(bseen, 7);
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0x10, false, bc, 3), 1); /* only the AFI 0x10 card */
+    CHECK_EQ(bc[0].pupi[0], 0x05);
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0, false, bc, 1), 1);    /* stops at `max` */
+    memset(g_bcards, 0, sizeof(g_bcards));
+    CHECK_EQ(st25r3916_nfcb_poll(&d, 0, false, bc, 3), 0);
+
+    /* ---- FeliCa: SENSF_REQ with the system code, filtering, slots, the LEN byte ---- */
+    reset_chip();
+    memset(g_fcards, 0, sizeof(g_fcards));
+    g_fcards[0] = (fake_f_t){.present = true,
+                             .idm = {0x01, 0x2E, 0x3C, 0x4D, 0x5E, 0x6F, 0x70, 0x10},
+                             .pmm = {0x03, 0x01, 0x4B, 0x02, 0x4F, 0x49, 0x93, 0xFF},
+                             .sys = 0x12FC};
+    CHECK_EQ(st25r3916_field_on_tech(&d, ST25R_TECH_F, ST25R_BR_106), ST25R_ERR_PARAM);
+    CHECK_EQ(st25r3916_field_on_tech(&d, ST25R_TECH_F, ST25R_BR_212), ST25R_OK);
+    st25r_nfcf_t fc;
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0xFFFF, 1, 0, &fc), ST25R_OK);
+    CHECK(!memcmp(fc.idm, g_fcards[0].idm, 8));
+    CHECK(!memcmp(fc.pmm, g_fcards[0].pmm, 8));
+    CHECK(fc.has_rd);
+    CHECK_EQ(fc.rd[0], 0x12);
+    CHECK_EQ(fc.rd[1], 0xFC);
+    CHECK_EQ(g_last_f_len, 5); /* no LEN byte from the host by default */
+    CHECK_EQ(g_last_f_tx[0], 0x00);
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0xFFFF, 0, 0, &fc), ST25R_OK);
+    CHECK(!fc.has_rd);
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0x0003, 0, 0, &fc), ST25R_ERR_TIMEOUT); /* other system */
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0xFFFF, 0, 2, &fc), ST25R_ERR_PARAM);
+    d.nfcf_host_len = true;
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0xFFFF, 1, 0, &fc), ST25R_OK);
+    CHECK_EQ(g_last_f_len, 6);
+    CHECK_EQ(g_last_f_tx[0], 6); /* LEN counts itself */
+    CHECK(!memcmp(fc.idm, g_fcards[0].idm, 8));
+    CHECK_EQ(fc.rd[1], 0xFC);
+    d.nfcf_host_len = false;
+    g_fcards[1] = g_fcards[0];
+    g_fcards[1].idm[7] = 0x21;
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0xFFFF, 0, 0, &fc), ST25R_ERR_CRC); /* same slot */
+    CHECK_EQ(st25r3916_nfcf_poll(&d, 0xFFFF, 0, 3, &fc), ST25R_OK);      /* 4 slots */
+    CHECK_EQ(fc.idm[7], 0x10);
+    memset(g_fcards, 0, sizeof(g_fcards));
+
+    /* ---- ISO 15693: the coding against known values ---- */
+    CHECK_EQ(st25r_nfcv_crc((const uint8_t[]){0x26, 0x01, 0x00}, 3), 0x0AF6); /* 26 01 00 F6 0A */
+    uint8_t enc[8];
+    CHECK_EQ(st25r_nfcv_encode((const uint8_t[]){0x26}, 1, enc, sizeof(enc)), 6);
+    CHECK_EQ(enc[0], 0x21); /* SOF */
+    CHECK_EQ(enc[1], 0x20); /* 0x26 = pairs 10 01 10 00, low pair first: v=2 -> slot 5 */
+    CHECK_EQ(enc[2], 0x08); /* v=1 -> slot 3 */
+    CHECK_EQ(enc[3], 0x20);
+    CHECK_EQ(enc[4], 0x02); /* v=0 -> slot 1 */
+    CHECK_EQ(enc[5], 0x04); /* EOF */
+    CHECK_EQ(st25r_nfcv_encode((const uint8_t[]){0x26}, 1, enc, 5), ST25R_ERR_NOMEM);
+    uint8_t vst[32] = {0}, vdec[8];
+    int vlen = v_answer_stream((const uint8_t[]){0xA5, 0x0F}, 2, vst);
+    CHECK_EQ(st25r_nfcv_decode(vst, vlen * 8, vdec, sizeof(vdec)), 2);
+    CHECK_EQ(vdec[0], 0xA5);
+    CHECK_EQ(vdec[1], 0x0F);
+    CHECK_EQ(st25r_nfcv_decode(vst, vlen * 8, vdec, 1), ST25R_ERR_NOMEM);
+    CHECK_EQ(st25r_nfcv_decode(vst, 20, vdec, sizeof(vdec)), ST25R_ERR_FRAMING); /* cut */
+    vst[1] |= 0x60; /* both halves of a data bit: two cards disagreeing */
+    CHECK_EQ(st25r_nfcv_decode(vst, vlen * 8, vdec, sizeof(vdec)), ST25R_ERR_COLLISION);
+
+    /* ---- ISO 15693: one card: INVENTORY, then READ SINGLE BLOCK addressed to it ---- */
+    reset_chip();
+    memset(g_vcards, 0, sizeof(g_vcards));
+    g_vcards[0] = (fake_v_t){.present = true, .uid = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x04, 0xE0},
+                             .dsfid = 0x00};
+    CHECK_EQ(st25r3916_field_on_tech(&d, ST25R_TECH_V, 0), ST25R_OK);
+    st25r_nfcv_t vc[4];
+    g_v_requests = 0;
+    CHECK_EQ(st25r3916_nfcv_inventory(&d, vc, 4), 1);
+    CHECK_EQ(g_v_requests, 1);
+    CHECK(!memcmp(vc[0].uid, g_vcards[0].uid, 8));
+    CHECK_EQ(g_v_last_len, 3);
+    CHECK_EQ(g_v_last_req[0], 0x26);
+    uint8_t rd[3 + 8] = {0x22, 0x20};
+    memcpy(rd + 2, vc[0].uid, 8);
+    rd[10] = 0x02;
+    uint8_t blk[8];
+    CHECK_EQ(st25r3916_nfcv_transceive(&d, rd, 11, blk, sizeof(blk), 20), 5);
+    CHECK_EQ(blk[0], 0x00);
+    CHECK_EQ(blk[1], 0x08);
+    CHECK_EQ(blk[4], 0x0B);
+    int vbits = 0; /* the generic transceive routes V frames the same way */
+    CHECK_EQ(st25r3916_transceive(&d, rd, 88, ST25R_TX_CRC, blk, sizeof(blk), &vbits, 20), 5);
+    CHECK_EQ(vbits, 40);
+    CHECK_EQ(st25r3916_nfcv_transceive(&d, rd, 11, blk, 2, 20), ST25R_ERR_NOMEM);
+    rd[2] ^= 1; /* nobody has that UID */
+    CHECK_EQ(st25r3916_nfcv_transceive(&d, rd, 11, blk, sizeof(blk), 20), ST25R_ERR_TIMEOUT);
+
+    /* ---- ISO 15693: four cards: collisions resolved by the mask search ---- */
+    g_vcards[1] = g_vcards[0];
+    g_vcards[1].uid[0] = 0x13; /* bit 1 differs */
+    g_vcards[2] = g_vcards[0];
+    g_vcards[2].uid[0] = 0x91; /* bit 7 */
+    g_vcards[3] = g_vcards[0];
+    g_vcards[3].uid[6] = 0x05; /* bit 48: a long shared prefix */
+    CHECK_EQ(st25r3916_nfcv_transceive(&d, (const uint8_t[]){0x26, 0x01, 0x00}, 3, blk,
+                                       sizeof(blk), 20),
+             ST25R_ERR_COLLISION);
+    g_v_requests = 0;
+    CHECK_EQ(st25r3916_nfcv_inventory(&d, vc, 4), 4);
+    int vseen = 0;
+    for (int i = 0; i < 4; i++) {
+        for (int k = 0; k < 4; k++) {
+            if (!memcmp(vc[i].uid, g_vcards[k].uid, 8)) {
+                vseen |= 1 << k;
+            }
+        }
+    }
+    CHECK_EQ(vseen, 15);
+    CHECK(g_v_requests < 140);
+    CHECK_EQ(st25r3916_nfcv_inventory(&d, vc, 2), 2); /* stops at `max` */
+    memset(g_vcards, 0, sizeof(g_vcards));
+    CHECK_EQ(st25r3916_nfcv_inventory(&d, vc, 4), 0);
+    reset_chip();
+    CHECK_EQ(st25r3916_field_on(&d), ST25R_OK); /* back to NFC-A for the tests below */
 
     /* ================= Listen mode (card emulation) ================= */
     reset_chip();

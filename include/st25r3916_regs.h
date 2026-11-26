@@ -172,6 +172,8 @@ enum {
 #define ST25R_OM_ISO14443B 0x2
 #define ST25R_OM_FELICA 0x3
 #define ST25R_OM_TOPAZ 0x4
+#define ST25R_OM_SUBC_STREAM 0xE /* sub-carrier stream mode (ISO 15693 reader) */
+#define ST25R_OM_BPSK_STREAM 0xF
 /* Target om values (Table 25): ISO14443A passive target = 0x1, FeliCa passive = 0x4 */
 
 /* ---- Bit rate definition register (0x04, DS13541 Table 26/27) -------------------------- */
@@ -188,6 +190,23 @@ enum {
 #define ST25R_A_NFC_F0 (1u << 5)    /* NFCIP-1 transport frame format */
 #define ST25R_A_P_LEN_SHIFT 1       /* modulation pulse width (p_len3:0) */
 #define ST25R_A_ANTCL (1u << 0)     /* 1 = bit-oriented ISO14443 anticollision frame */
+
+/* ---- ISO14443B settings (0x06/0x07, DS13541 Table 30/31) ------------------------------ *
+ * 0x06 = 0: EGT 0, SOF 10 etu low + 2 etu high, EOF 10 etu (ISO 14443-3 minimums).
+ * 0x07 = 0: minimum TR1 80/fs, SOF and EOF expected from the PICC, FeliCa preamble 48 bits. */
+#define ST25R_B_FELICA_FP_SHIFT 0 /* f_p1:0 FeliCa preamble length 48/64/80/96 */
+
+/* ---- Stream mode definition register (0x09, DS13541 Table 34/35/36) ------------------- */
+#define ST25R_STREAM_SCF_SHIFT 5 /* scf1:0 sub-carrier frequency */
+#define ST25R_STREAM_SCF_424 0x1 /* fc/32 (424 kHz) */
+#define ST25R_STREAM_SCP_SHIFT 3 /* scp1:0 sub-carrier pulses per report period */
+#define ST25R_STREAM_SCP_4 0x2
+#define ST25R_STREAM_SCP_8 0x3
+#define ST25R_STREAM_STX_SHIFT 0 /* stx2:0 Tx modulator period */
+#define ST25R_STREAM_STX_128 0x0 /* fc/128 (9.44 us, one ISO 15693 pulse slot) */
+
+/* ---- Auxiliary definition register (0x0A, DS13541 Table 37) ---------------------------- */
+#define ST25R_AUXDEF_NO_CRC_RX (1u << 7) /* receive without CRC check */
 
 /* ---- Number of transmitted bytes registers (0x22/0x23, DS13541 Table 70/71) ------------
  * 13-bit full-byte count ntx split across the two registers; nbtx2:0 in 0x23 is the number

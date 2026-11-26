@@ -50,6 +50,9 @@ typedef enum {
     ST25R_ANALOG_POLL_A,       /* NFC-A reader: Rx gain/threshold, Tx modulation */
     ST25R_ANALOG_LISTEN_A,     /* NFC-A card emulation */
     ST25R_ANALOG_WAKEUP,       /* wake-up measurement tuning */
+    ST25R_ANALOG_POLL_B,       /* ISO 14443-B reader (AM modulation index, Rx) */
+    ST25R_ANALOG_POLL_F,       /* FeliCa reader */
+    ST25R_ANALOG_POLL_V,       /* ISO 15693 reader (stream mode) */
     ST25R_ANALOG_EVENT_COUNT,
 } st25r_analog_event_t;
 
@@ -73,6 +76,10 @@ typedef struct {
     uint8_t ic_type; /* filled by st25r3916_probe() */
     uint8_t ic_rev;
     const st25r_analog_config_t *analog; /* optional; NULL = chip reset defaults only */
+    /* Reader settings; zero is the default for each. */
+    uint8_t tech;     /* the current st25r_tech_t (set by field_on / set_tech) */
+    bool nfcf_host_len; /* FeliCa: the host writes and reads the LEN byte (see below) */
+    bool nfcv_am;       /* ISO 15693: 10 % AM (the analog table sets the index), not OOK */
 } st25r_t;
 
 /* Negative return codes for the RF flows below. */
@@ -146,6 +153,23 @@ void st25r3916_apply_analog_config(st25r_t *d, st25r_analog_event_t event);
  * loads the values its antenna needs first. */
 int st25r3916_field_on(st25r_t *d);
 
+/* Reader protocols. */
+typedef enum {
+    ST25R_TECH_A = 0, /* ISO 14443-A / NFC-A */
+    ST25R_TECH_B,     /* ISO 14443-B / NFC-B */
+    ST25R_TECH_F,     /* FeliCa / NFC-F */
+    ST25R_TECH_V,     /* ISO 15693 / NFC-V (26 kbit/s, coded by the driver in stream mode) */
+} st25r_tech_t;
+
+/* As st25r3916_field_on(), for any protocol: `br` is the ST25R_BR_* bit rate both ways
+ * (A and B: 106..848; F: 212 or 424; V: ignored). */
+int st25r3916_field_on_tech(st25r_t *d, st25r_tech_t tech, uint8_t br);
+
+/* Switch the protocol and bit rates with the field on, e.g. to 424 kbit/s after an
+ * ISO 14443-4 PPS (A) or ATTRIB (B), which the caller sends. Applies that protocol's
+ * analog-config event. Returns ST25R_OK or ST25R_ERR_PARAM for a rate the protocol lacks. */
+int st25r3916_set_tech(st25r_t *d, st25r_tech_t tech, uint8_t br_tx, uint8_t br_rx);
+
 /* Switch the RF field off and return the chip to a low-power idle (oscillator off). */
 void st25r3916_field_off(st25r_t *d);
 
@@ -159,7 +183,16 @@ enum {
 /* Send `tx_bits` bits from `tx` and receive the card's answer into `rx` (capacity
  * `rx_cap` bytes). `*rx_bits` (may be NULL) receives the answer's length in bits (the last
  * byte may be partial). Returns the answer length in bytes (rounded up) or a negative
- * ST25R_ERR_*. The field must already be on. */
+ * ST25R_ERR_*. The field must already be on.
+ *
+ * In the current protocol (d->tech): A and B as given (the chip adds and checks the CRC with
+ * ST25R_TX_CRC; the answer keeps its 2 CRC bytes). F: whole bytes, without the LEN byte
+ * either way, and always with CRC. V: whole bytes; the driver codes the frame, adds the CRC
+ * with ST25R_TX_CRC and checks and strips it from the answer (st25r3916_nfcv_transceive).
+ *
+ * FeliCa LEN byte: DS13541 §4.4.4 says Transmit without CRC "skips the Length and CRC
+ * bytes", so the driver assumes the chip adds LEN on transmit and takes it off on receive.
+ * If a real chip shows otherwise, set d->nfcf_host_len and the driver handles LEN itself. */
 int st25r3916_transceive(st25r_t *d, const uint8_t *tx, int tx_bits, unsigned flags,
                          uint8_t *rx, int rx_cap, int *rx_bits, int timeout_ms);
 
@@ -186,6 +219,90 @@ int st25r3916_nfca_select(st25r_t *d, st25r_nfca_t *out);
 
 /* Send HLTA to the selected card (it goes to HALT and ignores REQA). Returns ST25R_OK. */
 int st25r3916_nfca_halt(st25r_t *d);
+
+/* ---- RF: ISO 14443-B (NFC-B) reader --------------------------------------------------
+ *
+ * UNTESTED ON HARDWARE. ISO 14443-3 type B: REQB/WUPB with time slots, ATTRIB, HLTB. Start
+ * with st25r3916_field_on_tech(d, ST25R_TECH_B, ST25R_BR_106).
+ */
+typedef struct {
+    uint8_t pupi[4];      /* pseudo-unique PICC identifier */
+    uint8_t app_data[4];  /* application data (AFI, CRC_B(AID), applications) */
+    uint8_t prot_info[3]; /* bit rates, max frame size, protocol type, FWI, ... */
+} st25r_nfcb_t;
+
+/* Find up to `max` type B cards with application family `afi` (0 = all). Tries one slot,
+ * and on a collision 16 slots with Slot-MARKERs, for a few rounds. `wupb` also wakes
+ * halted cards. Returns the number found (0: none) or a negative ST25R_ERR_*. Found cards
+ * wait in READY for ATTRIB; HLTB the ones you are done with. */
+int st25r3916_nfcb_poll(st25r_t *d, uint8_t afi, bool wupb, st25r_nfcb_t *out, int max);
+
+/* ATTRIB (select for ISO 14443-4): CID 0, default timings, our max frame 256 bytes at
+ * 106 kbit/s, the card's protocol type. Returns the answer's first byte (MBLI/CID, >= 0) or
+ * a negative ST25R_ERR_*. */
+int st25r3916_nfcb_attrib(st25r_t *d, const st25r_nfcb_t *card);
+
+/* HLTB: put the card to HALT. Returns ST25R_OK or a negative ST25R_ERR_*. */
+int st25r3916_nfcb_halt(st25r_t *d, const uint8_t pupi[4]);
+
+/* ---- RF: FeliCa (NFC-F) reader -------------------------------------------------------
+ *
+ * UNTESTED ON HARDWARE. JIS X 6319-4 polling (SENSF_REQ). Start with
+ * st25r3916_field_on_tech(d, ST25R_TECH_F, ST25R_BR_212) (or 424).
+ */
+typedef struct {
+    uint8_t idm[8]; /* manufacture ID (NFCID2) */
+    uint8_t pmm[8]; /* manufacture parameter */
+    uint8_t rd[2];  /* request data: the system code when asked for (has_rd) */
+    bool has_rd;
+} st25r_nfcf_t;
+
+/* Poll for a card with system code `sys_code` (0xFFFF = any). `rc` is the request code
+ * (0: none, 1: return the system code, 2: communication performance). `tsn` is the number
+ * of time slots minus one (0, 1, 3, 7 or 15). Returns ST25R_OK with the first card that
+ * answered cleanly, ST25R_ERR_TIMEOUT if none, ST25R_ERR_CRC if answers collided (poll
+ * again with more slots), or another negative ST25R_ERR_*. */
+int st25r3916_nfcf_poll(st25r_t *d, uint16_t sys_code, uint8_t rc, uint8_t tsn,
+                        st25r_nfcf_t *out);
+
+/* ---- RF: ISO 15693 (NFC-V) reader -----------------------------------------------------
+ *
+ * UNTESTED ON HARDWARE. The chip has no ISO 15693 framing: it sends and receives in stream
+ * mode (DS13541 Table 24/34) and the driver codes the frames itself: 1-out-of-4 pulse
+ * position at 26 kbit/s out, single-subcarrier Manchester in, both with SOF/EOF and the
+ * ISO/IEC 13239 CRC. DS13541 does not describe the stream format, so these are assumptions
+ * to check on a chip: FIFO bits go out and come in LSB first, one bit per stx period
+ * (fc/128) out and per report period (8 pulses of the 424 kHz subcarrier, half a data bit)
+ * in, 1 = a pulse / subcarrier seen. Start with st25r3916_field_on_tech(d, ST25R_TECH_V, 0).
+ */
+#define ST25R_NFCV_MAX_REQ 64  /* longest request (without CRC) the driver codes */
+#define ST25R_NFCV_MAX_RESP 72 /* longest answer (without CRC) it decodes */
+
+typedef struct {
+    uint8_t uid[8]; /* as sent, LSB first (uid[7] is 0xE0) */
+    uint8_t dsfid;
+} st25r_nfcv_t;
+
+/* Send request `req` (flags, command, parameters; no CRC) and receive the answer (flags
+ * byte first, CRC checked and removed) into `resp`. Returns the answer length, or
+ * ST25R_ERR_TIMEOUT, ST25R_ERR_COLLISION (two cards answered), ST25R_ERR_CRC,
+ * ST25R_ERR_FRAMING, ST25R_ERR_NOMEM, ST25R_ERR_PARAM. */
+int st25r3916_nfcv_transceive(st25r_t *d, const uint8_t *req, int req_len, uint8_t *resp,
+                              int resp_cap, int timeout_ms);
+
+/* Find up to `max` cards: one-slot INVENTORY, and on a collision a search that grows the
+ * UID mask one bit at a time (ISO 15693-3 §8 allows any mask). Returns the number found or
+ * a negative ST25R_ERR_*. */
+int st25r3916_nfcv_inventory(st25r_t *d, st25r_nfcv_t *out, int max);
+
+/* The ISO 15693 coding, exposed for tests and for other front ends. */
+uint16_t st25r_nfcv_crc(const uint8_t *data, int len); /* ISO/IEC 13239; send LSB first */
+/* Code `len` bytes (CRC included) as SOF + 1-out-of-4 + EOF stream bits. Returns bytes
+ * written to `out` (4 * len + 2), or ST25R_ERR_NOMEM. */
+int st25r_nfcv_encode(const uint8_t *data, int len, uint8_t *out, int cap);
+/* Decode a received stream (`nbits` bits) into bytes (CRC included). Returns the byte
+ * count, or ST25R_ERR_COLLISION / ST25R_ERR_FRAMING / ST25R_ERR_NOMEM. */
+int st25r_nfcv_decode(const uint8_t *stream, int nbits, uint8_t *out, int cap);
 
 /* ---- RF: ISO 14443-A card emulation (listen / target mode) -----------------------------
  *

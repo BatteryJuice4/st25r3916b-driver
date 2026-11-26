@@ -39,7 +39,18 @@ microcontroller.
   others answered, and HLTA + select again finds each in turn. The unit test drives it
   against fake cards with 4- and 7-byte UIDs, including collisions on the first and last UID
   bit and two 7-byte cards that only differ at cascade level 2.
-- **NFC-A card emulation** (`st25r3916_listen_start` / `listen_poll` / `listen_respond` /
+- **Other reader protocols and bit rates** (`st25r3916_field_on_tech`, `st25r3916_set_tech`):
+  NFC-A and B at 106–848 kbit/s (switch after the caller's PPS / ATTRIB), FeliCa at 212/424.
+  `st25r3916_transceive` follows the current protocol.
+- **ISO 14443-B** (`nfcb_poll` / `nfcb_attrib` / `nfcb_halt`): REQB/WUPB with AFI, one slot
+  and then 16 slots with Slot-MARKERs when answers collide, ATTRIB, HLTB.
+- **FeliCa** (`nfcf_poll`): SENSF_REQ with system code, request code and time slots, giving
+  IDm, PMm and the system code.
+- **ISO 15693** (`nfcv_inventory`, `nfcv_transceive`): the chip has no 15693 framing, so the
+  driver codes it in stream mode itself (1-out-of-4 out, Manchester in, SOF/EOF, ISO/IEC
+  13239 CRC, checked against the standard `26 01 00 → F6 0A` frame) and finds several cards
+  with an inventory mask search. The coding functions `st25r_nfcv_*` are public.
+ (`st25r3916_listen_start` / `listen_poll` / `listen_respond` /
   `listen_stop`): act as a tag. The chip answers REQA, anticollision and SELECT automatically
   from PT_Memory (loaded with the NFCID1/ATQA/SAK, 4- or 7-byte UID); the host is notified
   when a reader selects the card, then handles the higher-layer frames (RATS/APDU) over the
@@ -61,8 +72,7 @@ sections and, to be trusted, a real chip):
 - Ready-made **analog values for a specific antenna** — the table mechanism is here, but the
   numbers are yours to supply and tune (the driver runs on the chip's reset defaults without
   a table).
-- Higher bit rates (212/424/848 kbit/s) and ISO 14443-**B** / FeliCa / Topaz, as reader or
-  as a target.
+- Card emulation in protocols other than NFC-A, and Topaz / NFCIP-1 active mode.
 
 ## Using it
 
@@ -112,6 +122,10 @@ for a complete fake bus that emulates the register file.
 | `st25r3916_cmd` | Any direct command (`ST25R_CMD_*`) |
 | `st25r3916_field_on` / `field_off` | Power up to Ready and switch the RF field on/off |
 | `st25r3916_transceive` | Send/receive a frame (CRC, parity, anticollision flags) |
+| `st25r3916_field_on_tech` / `set_tech` | Reader protocol (A/B/F/V) and bit rate |
+| `st25r3916_nfcb_poll` / `nfcb_attrib` / `nfcb_halt` | ISO 14443-B reader |
+| `st25r3916_nfcf_poll` | FeliCa polling |
+| `st25r3916_nfcv_inventory` / `nfcv_transceive` | ISO 15693 reader (driver-coded stream mode) |
 | `st25r3916_nfca_request` / `nfca_select` / `nfca_halt` | REQA/WUPA, the ISO 14443-A UID cascade with collision resolution, HLTA |
 | `st25r3916_listen_start` / `listen_poll` / `listen_respond` / `listen_stop` | NFC-A card emulation |
 | `st25r3916_wakeup_start` / `wakeup_cause` / `wakeup_stop` | Low-power tag detection (wake-up mode) |
@@ -120,6 +134,12 @@ for a complete fake bus that emulates the register file.
 The RF calls expect the chip's IRQ pin wired to an optional `st25r_bus_t.wait_irq` callback
 (they poll the interrupt registers if it is `NULL`). They return `ST25R_OK` or a negative
 `ST25R_ERR_*`.
+
+Also to confirm on a chip: **FeliCa's LEN byte** is assumed to be added and removed by the
+chip (DS13541 §4.4.4 says Transmit without CRC "skips the Length and CRC bytes"; set
+`nfcf_host_len` if not), and **the stream-mode format** for ISO 15693 is assumed to be LSB
+first, one bit per fc/128 slot out and per 8 subcarrier pulses in (register 0x09 = 0x38),
+1 = pulse / subcarrier seen (DS13541 does not describe it).
 
 Two details of the split-byte anticollision frame are not spelled out in DS13541 and are
 assumptions to confirm on a real chip: the first received byte is aligned to the split
